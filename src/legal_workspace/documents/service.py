@@ -295,6 +295,9 @@ class DocumentService:
 
     @staticmethod
     def _invalidate_index(connection, document_id):
+        from legal_workspace.rag.service import ChatService
+
+        ChatService.invalidate_document(connection, document_id)
         connection.execute(
             update(Document).where(Document.id == document_id).values(active_index_id=None)
         )
@@ -308,6 +311,9 @@ class DocumentService:
             if document["kind"] == "base":
                 raise DocumentError("base_document_protected")
             with self.db.transaction() as connection:
+                from legal_workspace.rag.service import ChatService
+
+                ChatService.invalidate_document(connection, document_id)
                 connection.execute(
                     update(Document).where(Document.id == document_id).values(status="deleting")
                 )
@@ -316,6 +322,9 @@ class DocumentService:
     def _finish_delete(self, document_id):
         self.path(document_id).unlink(missing_ok=True)
         with self.db.transaction() as connection:
+            from legal_workspace.rag.service import ChatService
+
+            ChatService.invalidate_document(connection, document_id)
             connection.execute(delete(SourceSpan).where(SourceSpan.document_id == document_id))
             self._delete_jobs(connection, document_id)
             connection.execute(delete(Document).where(Document.id == document_id))

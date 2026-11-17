@@ -77,6 +77,12 @@ class Worker:
                 def handler(_payload):
                     return SearchService(self.database).process(claim)
 
+            if claim.kind == "chat.answer" and handler is None:
+                from legal_workspace.rag.service import ChatService
+
+                def handler(_payload):
+                    return ChatService(self.database).process(claim)
+
             if handler is None:
                 self.queue.fail(claim, "unsupported_job_kind", retryable=False)
                 return True
@@ -104,7 +110,11 @@ class Worker:
                     self.queue.fail(claim, "handler_failed")
             else:
                 if result.get("status") == "failed":
-                    self.queue.fail(claim, "document_processing_failed", retryable=False)
+                    self.queue.fail(
+                        claim,
+                        result.get("error_code", "document_processing_failed"),
+                        retryable=False,
+                    )
                 elif not self.queue.finish(claim, result):
                     logger.warning("job_result_discarded job_id=%s reason=lease_lost", claim.id)
         finally:

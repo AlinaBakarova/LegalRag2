@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.115,<1",
     "fastembed>=0.7,<0.8",
     "filelock>=3.16,<4",
+    "httpx>=0.28,<1",
     "nicegui>=3.0,<4",
     "numpy>=2,<3",
     "pydantic-settings>=2.7,<3",
@@ -42,6 +43,7 @@ testpaths = ["tests"]
 addopts = "-ra"
 markers = [
     "browser: real Chromium acceptance test (opt in with --browser)",
+    "ollama: actual local Qwen RAG integration (opt in with --ollama)",
     "real_model: offline test of a prepared ONNX model (opt in with --real-model)",
 ]
 

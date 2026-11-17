@@ -14,7 +14,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from legal_workspace.config import Settings
 from legal_workspace.documents.parsers import DocumentError
 from legal_workspace.documents.service import DocumentService
+from legal_workspace.llm.ollama import LLMError
 from legal_workspace.persistence.database import Database
+from legal_workspace.rag.service import ERRORS, ChatService
 from legal_workspace.retrieval.embeddings import SearchError
 from legal_workspace.retrieval.service import SearchService
 from legal_workspace.services import WorkspaceService
@@ -187,5 +189,61 @@ def create_api(settings: Settings) -> FastAPI:
     @app.get("/api/search/chunks/{chunk_id}")
     def source(chunk_id: int):
         return search_service.source(chunk_id)
+
+    chat = ChatService(database, search=search_service)
+    app.state.chat_service = chat
+
+    @app.exception_handler(LLMError)
+    async def chat_error(_request: Request, exc: LLMError):
+        code = str(exc)
+        status = (
+            404
+            if code in {"chat_not_found", "citation_not_found"}
+            else 409
+            if code == "chat_busy"
+            else 400
+        )
+        return JSONResponse(
+            {"detail": ERRORS.get(code, "Не удалось выполнить действие с диалогом.")},
+            status_code=status,
+        )
+
+    class ChatRequest(BaseModel):
+        question: str = Field(min_length=1, max_length=1500)
+        document_ids: list[str] | None = Field(default=None, max_length=100)
+
+    @app.get("/api/chat/sessions")
+    def sessions():
+        return chat.sessions()
+
+    @app.post("/api/chat/sessions", status_code=201)
+    def new_session():
+        return {"id": chat.create_session()}
+
+    @app.delete("/api/chat/sessions/{session_id}", status_code=204)
+    def delete_session(session_id: str):
+        chat.delete_session(session_id)
+
+    @app.get("/api/chat/sessions/{session_id}/messages")
+    def chat_messages(session_id: str):
+        return chat.messages(session_id)
+
+    @app.post("/api/chat/sessions/{session_id}/messages", status_code=202)
+    def send_question(session_id: str, request: ChatRequest):
+        return {"id": chat.send(session_id, request.question, request.document_ids)}
+
+    @app.post("/api/chat/messages/{message_id}/retry", status_code=202)
+    def retry_answer(message_id: str):
+        chat.retry(message_id)
+        return {"id": message_id}
+
+    @app.post("/api/chat/messages/{message_id}/cancel", status_code=202)
+    def cancel_answer(message_id: str):
+        chat.cancel(message_id)
+        return {"id": message_id}
+
+    @app.get("/api/chat/citations/{citation_id}")
+    def citation(citation_id: str):
+        return chat.citation(citation_id)
 
     return app

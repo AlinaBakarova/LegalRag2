@@ -14,6 +14,9 @@ from legal_workspace.persistence.database import Database
 
 def pytest_addoption(parser):
     parser.addoption(
+        "--ollama", action="store_true", help="Run real local Qwen/Ollama RAG integration test"
+    )
+    parser.addoption(
         "--real-model",
         action="store_true",
         help="Run offline ONNX smoke test against a prepared real model",
@@ -32,6 +35,13 @@ def pytest_collection_modifyitems(config, items):
             if "real_model" in item.keywords:
                 item.add_marker(
                     pytest.mark.skip(reason="Enable with --real-model after prepare-model")
+                )
+
+    if not config.getoption("--ollama"):
+        for item in items:
+            if "ollama" in item.keywords:
+                item.add_marker(
+                    pytest.mark.skip(reason="Enable with --ollama after ollama pull qwen3:4b")
                 )
 
 

@@ -51,19 +51,8 @@ def register_pages(service: WorkspaceService) -> None:
                 with ui.row().classes("w-full items-center"):
                     ui.label("Рабочее пространство").classes("text-lg font-semibold")
                     ui.space()
-                    ui.badge("Этап 3", color="secondary").props("outline")
+                    ui.badge("Этап 4", color="secondary").props("outline")
                 ui.separator()
-                with ui.column().classes("flex-1 w-full items-center justify-center gap-5 py-12"):
-                    ui.icon("forum", size="38px").classes("empty-icon")
-                    ui.label("Чат по вашим документам").classes("text-2xl font-medium text-center")
-                    ui.label(
-                        "Здесь можно будет задать вопрос и получить ответ с источниками."
-                    ).classes("text-center text-sm muted max-w-md")
-                with ui.row().classes("w-full items-center gap-3"):
-                    ui.input(placeholder="Чат пока недоступен").props(
-                        "outlined aria-label=Вопрос"
-                    ).classes("flex-1").disable()
-                    ui.button(icon="arrow_upward").props("round aria-label=Отправить").disable()
-                ui.label("Документы и вопросы пока не передаются внешним AI-сервисам.").classes(
-                    "text-xs muted"
-                )
+                from legal_workspace.ui.chat import chat_panel
+
+                chat_panel(service.database)

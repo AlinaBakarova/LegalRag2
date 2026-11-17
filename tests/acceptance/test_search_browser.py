@@ -20,7 +20,7 @@ def test_main_screen_has_chat_placeholder_and_no_retrieval_controls(runtime):
         expect(page.get_by_text("Базовая библиотека", exact=True)).to_be_visible()
         expect(page.get_by_text("Мои документы", exact=True)).to_be_visible()
         expect(page.get_by_text("Чат по вашим документам", exact=True)).to_be_visible()
-        expect(page.get_by_label("Вопрос", exact=True)).to_be_disabled()
+        expect(page.get_by_label("Вопрос", exact=True)).to_be_enabled()
         for label in ("Поисковый запрос", "Способ поиска", "Область поиска"):
             expect(page.get_by_label(label, exact=True)).to_have_count(0)
         expect(page.get_by_role("button", name="Найти", exact=True)).to_have_count(0)

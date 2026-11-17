@@ -131,3 +131,58 @@ class Chunk(Base):
     heading: Mapped[str] = mapped_column(sa.Text)
     terms: Mapped[str] = mapped_column(sa.Text)
     embedding: Mapped[bytes] = mapped_column(sa.LargeBinary)
+
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("chat_sessions.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(sa.Text)
+    status: Mapped[str] = mapped_column(String(20))
+    reply_to: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    scope: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    usage: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[float] = mapped_column(Float)
+    __table_args__ = (sa.UniqueConstraint("session_id", "ordinal"),)
+
+
+class ChatDependency(Base):
+    __tablename__ = "chat_dependencies"
+    message_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("chat_messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    document_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    text_revision: Mapped[str] = mapped_column(String(32))
+
+
+class ChatCitation(Base):
+    __tablename__ = "chat_citations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    message_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("chat_messages.id", ondelete="CASCADE"), index=True
+    )
+    document_id: Mapped[str] = mapped_column(sa.ForeignKey("documents.id", ondelete="CASCADE"))
+    text_revision: Mapped[str] = mapped_column(String(32))
+    span_id: Mapped[int] = mapped_column(Integer)
+    start: Mapped[int] = mapped_column(Integer)
+    end: Mapped[int] = mapped_column(Integer)
+    quote: Mapped[str] = mapped_column(sa.Text)
+    locator: Mapped[dict] = mapped_column(JSON)
+    title: Mapped[str] = mapped_column(sa.Text)
+    heading: Mapped[str] = mapped_column(sa.Text)
+    claim_ordinal: Mapped[int] = mapped_column(Integer)

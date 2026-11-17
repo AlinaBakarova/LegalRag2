@@ -1,0 +1,538 @@
+import json
+import logging
+import time
+from uuid import uuid4
+
+from sqlalchemy import delete, func, select, update
+
+from legal_workspace.llm.ollama import LLMError, OllamaGenerator
+from legal_workspace.persistence.models import (
+    ChatCitation,
+    ChatDependency,
+    ChatMessage,
+    ChatSession,
+    Chunk,
+    Document,
+    Job,
+    SourceSpan,
+)
+from legal_workspace.rag.pipeline import CallBudget, build_context, generate_answer
+from legal_workspace.retrieval.embeddings import SearchError
+from legal_workspace.retrieval.service import SearchService
+
+logger = logging.getLogger(__name__)
+TERMINAL = {"completed", "insufficient", "failed", "removed", "cancelled"}
+INSUFFICIENT = (
+    "В доступных источниках недостаточно информации для обоснованного "
+    "ответа. Уточните вопрос или добавьте документы."
+)
+ERRORS = {
+    "llm_unavailable": "Не удалось подключиться к Ollama. Проверьте, что Ollama запущена.",
+    "llm_model_missing": (
+        "Модель не найдена в Ollama. Загрузите настроенную модель и повторите запрос."
+    ),
+    "llm_timeout": "Модель не успела ответить. Попробуйте задать более короткий вопрос.",
+    "llm_api_error": "Ollama отклонила запрос. Проверьте её версию и выбранную модель.",
+    "llm_invalid_response": "Не удалось прочитать ответ модели. Попробуйте повторить запрос.",
+    "llm_busy": "Локальная модель сейчас недоступна или занята. Повторите запрос позже.",
+    "model_not_ready": "Поисковая модель ещё не подготовлена.",
+    "index_not_ready": "Документы ещё готовятся к поиску. Повторите вопрос после обработки.",
+    "llm_context_limit": (
+        "Вопрос и источники слишком велики для контекста модели. Сократите "
+        "вопрос или выберите меньше документов."
+    ),
+    "llm_output_limit": "Модель не смогла завершить ответ. Попробуйте уточнить вопрос.",
+    "llm_budget_exceeded": (
+        "Достигнут лимит времени или попыток ответа. Уточните вопрос и повторите запрос."
+    ),
+    "invalid_citations": (
+        "Не удалось подтвердить цитаты в ответе модели. Уточните вопрос и попробуйте снова."
+    ),
+    "unsupported_answer": (
+        "Не удалось подтвердить ответ по источникам. Уточните вопрос и попробуйте снова."
+    ),
+    "sources_changed": "Источники изменились во время ответа. Повторите вопрос.",
+    "processing_interrupted": "Формирование ответа было прервано. Повторите запрос.",
+}
+
+
+class ChatService:
+    def __init__(self, database, *, search=None, generator=None):
+        self.db = database
+        self.settings = database.settings
+        self.search = search if search is not None else SearchService(database)
+        self.generator = generator if generator is not None else OllamaGenerator(self.settings)
+
+    def sessions(self):
+        with self.db.engine.connect() as connection:
+            return [
+                dict(row)
+                for row in connection.execute(
+                    select(ChatSession.__table__).order_by(ChatSession.created_at.desc())
+                ).mappings()
+            ]
+
+    def create_session(self):
+        session_id = uuid4().hex
+        with self.db.transaction() as connection:
+            connection.execute(
+                ChatSession.__table__.insert().values(
+                    id=session_id, title="Новый диалог", created_at=time.time()
+                )
+            )
+        return session_id
+
+    def send(self, session_id, question, document_ids=None):
+        question = question.strip()
+        if not question or len(question) > 1500:
+            raise LLMError("invalid_question")
+        with self.db.transaction(immediate=True) as connection:
+            if not connection.scalar(select(ChatSession.id).where(ChatSession.id == session_id)):
+                raise LLMError("chat_not_found")
+            if connection.scalar(
+                select(ChatMessage.id).where(
+                    ChatMessage.session_id == session_id,
+                    ChatMessage.status.in_(["queued", "running"]),
+                )
+            ):
+                raise LLMError("chat_busy")
+            ordinal = connection.scalar(
+                select(func.max(ChatMessage.ordinal)).where(ChatMessage.session_id == session_id)
+            )
+            ordinal = 0 if ordinal is None else ordinal + 1
+            user_id, reply_id = uuid4().hex, uuid4().hex
+            now = time.time()
+            connection.execute(
+                ChatMessage.__table__.insert(),
+                [
+                    dict(
+                        id=user_id,
+                        session_id=session_id,
+                        ordinal=ordinal,
+                        role="user",
+                        content=question,
+                        status="completed",
+                        reply_to=None,
+                        scope=document_ids,
+                        usage={},
+                        created_at=now,
+                    ),
+                    dict(
+                        id=reply_id,
+                        session_id=session_id,
+                        ordinal=ordinal + 1,
+                        role="assistant",
+                        content="",
+                        status="queued",
+                        reply_to=user_id,
+                        scope=document_ids,
+                        usage={},
+                        created_at=now,
+                    ),
+                ],
+            )
+            if ordinal == 0:
+                connection.execute(
+                    update(ChatSession)
+                    .where(ChatSession.id == session_id)
+                    .values(title=question[:70])
+                )
+            self._enqueue(connection, reply_id)
+        return reply_id
+
+    @staticmethod
+    def _enqueue(connection, reply_id):
+        now = time.time()
+        connection.execute(
+            Job.__table__.insert().values(
+                id=uuid4().hex,
+                kind="chat.answer",
+                payload={"message_id": reply_id},
+                status="queued",
+                priority=10,
+                attempts=0,
+                max_attempts=1,
+                created_at=now,
+                updated_at=now,
+                available_at=now,
+            )
+        )
+
+    def reconcile(self):
+        with self.db.transaction() as connection:
+            failed = connection.execute(
+                select(Job.payload, Job.error_code).where(
+                    Job.kind == "chat.answer", Job.status == "failed"
+                )
+            ).all()
+            for payload, error in failed:
+                connection.execute(
+                    update(ChatMessage)
+                    .where(
+                        ChatMessage.id == payload.get("message_id"),
+                        ChatMessage.status.in_(["queued", "running"]),
+                    )
+                    .values(
+                        status="failed", content="", error_code=error or "processing_interrupted"
+                    )
+                )
+
+    def messages(self, session_id):
+        self.reconcile()
+        with self.db.engine.connect() as connection:
+            messages = [
+                dict(row)
+                for row in connection.execute(
+                    select(ChatMessage.__table__)
+                    .where(ChatMessage.session_id == session_id)
+                    .order_by(ChatMessage.ordinal)
+                ).mappings()
+            ]
+            for message in messages:
+                message["citations"] = [
+                    dict(row)
+                    for row in connection.execute(
+                        select(ChatCitation.__table__).where(
+                            ChatCitation.message_id == message["id"]
+                        )
+                    ).mappings()
+                ]
+                if message["status"] == "failed":
+                    message["error"] = ERRORS.get(
+                        message["error_code"], "Не удалось сформировать ответ. Повторите запрос."
+                    )
+                message.pop("error_code")
+        return messages
+
+    def retry(self, reply_id):
+        with self.db.transaction(immediate=True) as connection:
+            row = (
+                connection.execute(select(ChatMessage.__table__).where(ChatMessage.id == reply_id))
+                .mappings()
+                .first()
+            )
+            if (
+                row is None
+                or row["role"] != "assistant"
+                or row["status"] not in {"failed", "cancelled"}
+            ):
+                raise LLMError("invalid_retry")
+            if connection.scalar(
+                select(ChatMessage.id).where(
+                    ChatMessage.session_id == row["session_id"],
+                    ChatMessage.status.in_(["queued", "running"]),
+                )
+            ):
+                raise LLMError("chat_busy")
+            self._delete_jobs(connection, {reply_id})
+            connection.execute(delete(ChatCitation).where(ChatCitation.message_id == reply_id))
+            connection.execute(delete(ChatDependency).where(ChatDependency.message_id == reply_id))
+            connection.execute(
+                update(ChatMessage)
+                .where(ChatMessage.id == reply_id)
+                .values(status="queued", content="", error_code=None, usage={})
+            )
+            self._enqueue(connection, reply_id)
+
+    @staticmethod
+    def _delete_jobs(connection, message_ids):
+        for job_id, payload in connection.execute(
+            select(Job.id, Job.payload).where(Job.kind == "chat.answer")
+        ).all():
+            if payload.get("message_id") in message_ids:
+                connection.execute(delete(Job).where(Job.id == job_id))
+
+    def cancel(self, reply_id):
+        with self.db.transaction(immediate=True) as connection:
+            self._delete_jobs(connection, {reply_id})
+            connection.execute(
+                update(ChatMessage)
+                .where(ChatMessage.id == reply_id, ChatMessage.status.in_(["queued", "running"]))
+                .values(status="cancelled", content="")
+            )
+
+    def delete_session(self, session_id):
+        with self.db.transaction(immediate=True) as connection:
+            ids = set(
+                connection.execute(
+                    select(ChatMessage.id).where(ChatMessage.session_id == session_id)
+                ).scalars()
+            )
+            self._delete_jobs(connection, ids)
+            connection.execute(delete(ChatSession).where(ChatSession.id == session_id))
+
+    @staticmethod
+    def invalidate_document(connection, document_id):
+        ids = set(
+            connection.execute(
+                select(ChatDependency.message_id).where(ChatDependency.document_id == document_id)
+            ).scalars()
+        )
+        if not ids:
+            return
+        ChatService._delete_jobs(connection, ids)
+        connection.execute(delete(ChatCitation).where(ChatCitation.message_id.in_(ids)))
+        connection.execute(delete(ChatDependency).where(ChatDependency.message_id.in_(ids)))
+        connection.execute(
+            update(ChatMessage)
+            .where(ChatMessage.id.in_(ids))
+            .values(
+                status="removed",
+                content="",
+                error_code=None,
+                usage={},
+            )
+        )
+
+    @staticmethod
+    def _owned(connection, claim):
+        return bool(
+            connection.scalar(
+                select(Job.id)
+                .join(ChatMessage, ChatMessage.id == claim.payload["message_id"])
+                .where(
+                    Job.id == claim.id,
+                    Job.lease_token == claim.token,
+                    Job.status == "running",
+                    Job.lease_expires_at > time.time(),
+                    ChatMessage.status.in_(["queued", "running"]),
+                )
+            )
+        )
+
+    def _live(self, connection, claim):
+        reply_id = claim.payload["message_id"]
+        live = connection.scalar(
+            select(Job.id).where(
+                Job.id == claim.id,
+                Job.lease_token == claim.token,
+                Job.status == "running",
+                Job.lease_expires_at > time.time(),
+            )
+        )
+        reply = connection.scalar(
+            select(ChatMessage.id).where(
+                ChatMessage.id == reply_id, ChatMessage.status.in_(["queued", "running"])
+            )
+        )
+        if not live or not reply:
+            raise LLMError("sources_changed")
+        for document_id, revision in connection.execute(
+            select(ChatDependency.document_id, ChatDependency.text_revision).where(
+                ChatDependency.message_id == reply_id
+            )
+        ):
+            if not connection.scalar(
+                select(Document.id).where(
+                    Document.id == document_id,
+                    Document.text_revision == revision,
+                    Document.status.in_(["ready", "needs_review"]),
+                )
+            ):
+                raise LLMError("sources_changed")
+
+    def _check_live(self, claim):
+        with self.db.engine.connect() as connection:
+            self._live(connection, claim)
+
+    def _history(self, connection, reply):
+        prior = (
+            connection.execute(
+                select(ChatMessage.__table__)
+                .where(
+                    ChatMessage.session_id == reply["session_id"],
+                    ChatMessage.ordinal < reply["ordinal"] - 1,
+                    ChatMessage.status == "completed",
+                )
+                .order_by(ChatMessage.ordinal.desc())
+                .limit(6)
+            )
+            .mappings()
+            .all()
+        )
+        prior = list(reversed(prior))
+        dependencies = {}
+        for message in prior:
+            for document_id, revision in connection.execute(
+                select(ChatDependency.document_id, ChatDependency.text_revision).where(
+                    ChatDependency.message_id == message["id"]
+                )
+            ):
+                if document_id in dependencies and dependencies[document_id] != revision:
+                    raise LLMError("sources_changed")
+                dependencies[document_id] = revision
+        return [{"role": m["role"], "content": m["content"]} for m in prior], dependencies
+
+    def _context_sources(self, question, scope, history):
+        previous_questions = [m["content"] for m in history if m["role"] == "user"][-1:]
+        query = (" ".join(previous_questions) + " " + question).strip()[-1500:]
+        found = self.search.search(query, document_ids=scope, limit=8)
+        # Expand a retrieved header to a neighbouring chunk in the same generation.
+        expanded = []
+        seen = set()
+        for item in found:
+            candidates = [item]
+            with self.db.engine.connect() as connection:
+                chunk = connection.execute(
+                    select(Chunk.generation_id, Chunk.ordinal).where(Chunk.id == item["id"])
+                ).first()
+                if chunk:
+                    neighbour = connection.scalar(
+                        select(Chunk.id).where(
+                            Chunk.generation_id == chunk.generation_id,
+                            Chunk.ordinal == chunk.ordinal + 1,
+                        )
+                    )
+                    if neighbour:
+                        candidates.append(self.search.source(neighbour))
+            for candidate in candidates:
+                if candidate["id"] not in seen:
+                    seen.add(candidate["id"])
+                    expanded.append(candidate)
+        return expanded
+
+    @staticmethod
+    def _verify_proof(connection, citation):
+        row = connection.execute(
+            select(SourceSpan.text, Document.text_revision, Document.status, Document.id)
+            .join(Document, Document.id == SourceSpan.document_id)
+            .where(SourceSpan.id == citation["span_id"], Document.id == citation["document_id"])
+        ).first()
+        if (
+            row is None
+            or row.text_revision != citation["text_revision"]
+            or row.status not in {"ready", "needs_review"}
+            or row.text[citation["start"] : citation["end"]] != citation["quote"]
+        ):
+            raise LLMError("sources_changed")
+
+    def citation(self, citation_id):
+        with self.db.engine.connect() as connection:
+            row = (
+                connection.execute(
+                    select(ChatCitation.__table__)
+                    .join(ChatMessage, ChatMessage.id == ChatCitation.message_id)
+                    .where(ChatCitation.id == citation_id, ChatMessage.status == "completed")
+                )
+                .mappings()
+                .first()
+            )
+            if row is None:
+                raise LLMError("citation_not_found")
+            self._verify_proof(connection, row)
+            return dict(row)
+
+    def process(self, claim):
+        reply_id = claim.payload["message_id"]
+        budget = CallBudget(self.settings, self.generator, lambda: self._check_live(claim))
+        coverage = {}
+        try:
+            with self.db.transaction(immediate=True) as connection:
+                reply = (
+                    connection.execute(
+                        select(ChatMessage.__table__).where(ChatMessage.id == reply_id)
+                    )
+                    .mappings()
+                    .first()
+                )
+                if reply is None or reply["status"] in TERMINAL:
+                    return {"skipped": True}
+                self._live(connection, claim)
+                question = connection.scalar(
+                    select(ChatMessage.content).where(ChatMessage.id == reply["reply_to"])
+                )
+                history, dependencies = self._history(connection, reply)
+                connection.execute(
+                    update(ChatMessage).where(ChatMessage.id == reply_id).values(status="running")
+                )
+            sources = self._context_sources(question, reply["scope"], history)
+            if sources:
+                messages, contexts = build_context(self.settings, question, history, sources)
+                search_status = self.search.status()
+                coverage = {
+                    "partial_sources": any(s["warnings"] for s in contexts.values()),
+                    "partial_corpus": search_status["indexed"] < search_status["available"],
+                }
+                for source in contexts.values():
+                    if (
+                        source["document_id"] in dependencies
+                        and dependencies[source["document_id"]] != source["text_revision"]
+                    ):
+                        raise LLMError("sources_changed")
+                    dependencies[source["document_id"]] = source["text_revision"]
+            else:
+                contexts = {}
+            with self.db.transaction(immediate=True) as connection:
+                self._live(connection, claim)
+                connection.execute(
+                    delete(ChatDependency).where(ChatDependency.message_id == reply_id)
+                )
+                for document_id, revision in dependencies.items():
+                    if not connection.scalar(
+                        select(Document.id).where(
+                            Document.id == document_id,
+                            Document.text_revision == revision,
+                            Document.status.in_(["ready", "needs_review"]),
+                        )
+                    ):
+                        raise LLMError("sources_changed")
+                    connection.execute(
+                        ChatDependency.__table__.insert().values(
+                            message_id=reply_id, document_id=document_id, text_revision=revision
+                        )
+                    )
+            if contexts:
+                draft, citations = generate_answer(budget, messages, contexts, question)
+                content = (
+                    json.dumps([c.text for c in draft.claims], ensure_ascii=False)
+                    if draft.sufficient
+                    else INSUFFICIENT
+                )
+                status = "completed" if draft.sufficient else "insufficient"
+            else:
+                content, status, citations = INSUFFICIENT, "insufficient", []
+            with self.db.transaction(immediate=True) as connection:
+                self._live(connection, claim)
+                for citation in citations:
+                    self._verify_proof(connection, citation)
+                    connection.execute(
+                        ChatCitation.__table__.insert().values(
+                            id=uuid4().hex, message_id=reply_id, **citation
+                        )
+                    )
+                connection.execute(
+                    update(ChatMessage)
+                    .where(ChatMessage.id == reply_id)
+                    .values(
+                        status=status,
+                        content=content,
+                        usage={**budget.usage(), **coverage},
+                        model=self.settings.llm_model,
+                        error_code=None,
+                    )
+                )
+            logger.info(
+                "chat_answer_finished message_id=%s status=%s calls=%s",
+                reply_id,
+                status,
+                budget.calls,
+            )
+            return {"answered": True}
+        except (LLMError, SearchError) as exc:
+            code = str(exc)
+            with self.db.transaction(immediate=True) as connection:
+                if not self._owned(connection, claim):
+                    return {"skipped": True}
+                connection.execute(
+                    update(ChatMessage)
+                    .where(ChatMessage.id == reply_id)
+                    .values(
+                        status="failed",
+                        content="",
+                        error_code=code,
+                        usage={**budget.usage(), **coverage},
+                        model=self.settings.llm_model,
+                    )
+                )
+            logger.warning("chat_answer_failed message_id=%s code=%s", reply_id, code)
+            return {"status": "failed", "error_code": code}

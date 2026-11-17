@@ -409,6 +409,8 @@ class SearchService:
                         Chunk.heading,
                         Chunk.start,
                         Chunk.end,
+                        SourceSpan.id.label("span_id"),
+                        Document.text_revision,
                         SourceSpan.text.label("source_text"),
                         SourceSpan.locator,
                         Document.id.label("document_id"),

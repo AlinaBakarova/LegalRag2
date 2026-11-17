@@ -53,6 +53,9 @@ class Database:
         from legal_workspace.retrieval.service import SearchService
 
         SearchService(self).recover()
+        from legal_workspace.rag.service import ChatService
+
+        ChatService(self).reconcile()
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[Connection]:
