@@ -64,6 +64,12 @@ class Worker:
             self._current = claim
         try:
             handler = self.handlers.get(claim.kind)
+            if claim.kind == "document.extract" and handler is None:
+                from legal_workspace.documents.service import DocumentService
+
+                def handler(_payload):
+                    return DocumentService(self.database).process(claim)
+
             if handler is None:
                 self.queue.fail(claim, "unsupported_job_kind", retryable=False)
                 return True

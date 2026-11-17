@@ -26,7 +26,8 @@ def create_app(settings: Settings):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Legal AI Workspace")
-    parser.add_argument("command", choices=["init", "serve", "worker", "check"])
+    parser.add_argument("command", choices=["init", "serve", "worker", "check", "import-corpus"])
+    parser.add_argument("--manifest", default="corpus/manifest.json")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     try:
@@ -54,6 +55,14 @@ def main() -> int:
                 from legal_workspace.services import WorkspaceService
 
                 print(WorkspaceService(database).schedule_check())
+            elif args.command == "import-corpus":
+                from pathlib import Path
+
+                from legal_workspace.documents.corpus_import import import_corpus
+                from legal_workspace.documents.service import DocumentService
+
+                ids = import_corpus(DocumentService(database), Path(args.manifest))
+                print(f"Corpus documents imported: {len(ids)}")
             elif args.command == "worker":
                 from legal_workspace.jobs.worker import Worker
 

@@ -1,3 +1,4 @@
+import sqlalchemy as sa
 from sqlalchemy import JSON, CheckConstraint, Float, Index, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -57,3 +58,42 @@ class WorkerState(Base):
     started_at: Mapped[float] = mapped_column(Float)
     heartbeat_at: Mapped[float] = mapped_column(Float)
     stopped_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    __table_args__ = (
+        CheckConstraint("kind IN ('base', 'user')", name="document_kind"),
+        CheckConstraint(
+            "status IN ('uploaded', 'ready', 'needs_ocr', 'needs_review', "
+            "'failed', 'deleting', 'deleted')",
+            name="document_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(8))
+    filename: Mapped[str] = mapped_column(String(255))
+    sha256: Mapped[str] = mapped_column(String(64))
+    size: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[float] = mapped_column(Float)
+    parser_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    warnings: Mapped[list] = mapped_column(JSON)
+    source: Mapped[dict] = mapped_column(JSON)
+    corpus_key: Mapped[str | None] = mapped_column(String(200), unique=True, nullable=True)
+
+
+class SourceSpan(Base):
+    __tablename__ = "source_spans"
+    __table_args__ = (sa.UniqueConstraint("document_id", "ordinal"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(sa.Text)
+    locator: Mapped[dict] = mapped_column(JSON)
+    start: Mapped[int] = mapped_column(Integer)
+    end: Mapped[int] = mapped_column(Integer)

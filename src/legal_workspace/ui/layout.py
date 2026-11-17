@@ -51,31 +51,16 @@ def register_pages(service: WorkspaceService) -> None:
         with ui.element("main").classes("workspace-grid"):
             with ui.column().classes("panel gap-6"):
                 ui.label("ДОКУМЕНТЫ").classes("eyebrow muted")
-                with ui.column().classes("gap-3 w-full"):
-                    with ui.row().classes("items-center gap-2"):
-                        ui.icon("account_balance", size="20px")
-                        ui.label("Базовая библиотека").classes("font-medium")
-                        ui.icon("lock", size="14px").classes("muted")
-                    ui.label("Нормативные документы ещё не добавлены.").classes("text-sm muted")
-                ui.separator()
-                with ui.column().classes("gap-3 w-full"):
-                    with ui.row().classes("items-center gap-2"):
-                        ui.icon("folder_open", size="20px")
-                        ui.label("Мои документы").classes("font-medium")
-                    ui.label("Здесь будут ваши файлы и результаты их обработки.").classes(
-                        "text-sm muted"
-                    )
-                    ui.button("Загрузить документ", icon="add").props("outline no-caps").disable()
-                ui.space()
-                ui.label("Загрузка и просмотр документов появятся на следующем этапе.").classes(
-                    "text-xs muted"
-                )
+                from legal_workspace.documents.service import DocumentService
+                from legal_workspace.ui.documents import document_panel
+
+                document_panel(DocumentService(service.database))
 
             with ui.column().classes("panel chat-panel gap-5"):
                 with ui.row().classes("w-full items-center"):
                     ui.label("Рабочее пространство").classes("text-lg font-semibold")
                     ui.space()
-                    ui.badge("Этап 1", color="secondary").props("outline")
+                    ui.badge("Этап 2", color="secondary").props("outline")
                 ui.separator()
                 with ui.column().classes("flex-1 w-full items-center justify-center gap-5 py-12"):
                     ui.icon("auto_stories", size="38px").classes("empty-icon")
@@ -155,7 +140,11 @@ def register_pages(service: WorkspaceService) -> None:
                             ui.label("Проверок пока нет").classes("text-sm muted")
                         for job in jobs[:5]:
                             with ui.column().classes("gap-0"):
-                                ui.label(STATUS_LABELS[job["status"]]).classes("text-sm")
+                                ui.label(
+                                    STATUS_LABELS[job["status"]]
+                                    if job["kind"] == "system.check"
+                                    else "Обработка документа: " + job["status"]
+                                ).classes("text-sm")
                                 date = datetime.fromtimestamp(
                                     job["created_at"], ZoneInfo("Europe/Moscow")
                                 )

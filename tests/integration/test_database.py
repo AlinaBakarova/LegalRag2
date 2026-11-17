@@ -14,7 +14,7 @@ def test_migration_matches_models_and_enables_sqlite_features(database):
         assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
         assert (
             connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-            == "0001_foundation"
+            == "0002_documents"
         )
         assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
 

@@ -47,6 +47,10 @@ class Database:
                     .on_conflict_do_nothing(index_elements=["id"])
                 )
 
+        from legal_workspace.documents.service import DocumentService
+
+        DocumentService(self).recover()
+
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[Connection]:
         with self.engine.connect() as connection:

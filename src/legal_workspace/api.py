@@ -1,13 +1,16 @@
 import logging
 from contextlib import asynccontextmanager
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from legal_workspace.config import Settings
+from legal_workspace.documents.parsers import DocumentError
+from legal_workspace.documents.service import MAX_FILE, DocumentService
 from legal_workspace.persistence.database import Database
 from legal_workspace.services import WorkspaceService
 
@@ -74,5 +77,54 @@ def create_api(settings: Settings) -> FastAPI:
     @app.post("/api/jobs/check", status_code=202)
     def schedule_check():
         return {"id": service.schedule_check()}
+
+    documents = DocumentService(database)
+
+    @app.exception_handler(DocumentError)
+    async def document_error(_request: Request, exc: DocumentError):
+        code = str(exc)
+        status_code = (
+            404 if code == "not_found" else 403 if code == "base_document_protected" else 400
+        )
+        return JSONResponse({"detail": code}, status_code=status_code)
+
+    @app.get("/api/documents")
+    def list_documents():
+        return documents.list()
+
+    @app.post("/api/documents", status_code=202)
+    async def upload_document(file: UploadFile):
+        try:
+            data = await file.read(MAX_FILE + 1)
+            return {"id": await run_in_threadpool(documents.upload, file.filename or "", data)}
+        finally:
+            await file.close()
+
+    @app.get("/api/documents/{document_id}")
+    def get_document(document_id: str):
+        return documents.get(document_id)
+
+    @app.get("/api/documents/{document_id}/spans")
+    def get_spans(document_id: str):
+        return documents.spans(document_id)
+
+    @app.get("/api/documents/{document_id}/original")
+    def original(document_id: str):
+        with documents.lock:
+            document = documents.get(document_id)
+            data = documents.path(document_id).read_bytes()
+        return Response(
+            data,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": "attachment; filename*=UTF-8''"
+                + quote(document["filename"]),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @app.delete("/api/documents/{document_id}", status_code=204)
+    def delete_document(document_id: str):
+        documents.delete(document_id)
 
     return app
