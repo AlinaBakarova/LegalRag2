@@ -3,14 +3,15 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.exc import SQLAlchemyError
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from legal_workspace.config import Settings
 from legal_workspace.documents.parsers import DocumentError
-from legal_workspace.documents.service import MAX_FILE, DocumentService
+from legal_workspace.documents.service import DocumentService
 from legal_workspace.persistence.database import Database
 from legal_workspace.services import WorkspaceService
 
@@ -95,8 +96,11 @@ def create_api(settings: Settings) -> FastAPI:
     @app.post("/api/documents", status_code=202)
     async def upload_document(file: UploadFile):
         try:
-            data = await file.read(MAX_FILE + 1)
-            return {"id": await run_in_threadpool(documents.upload, file.filename or "", data)}
+            return {
+                "id": await run_in_threadpool(
+                    documents.upload_stream, file.filename or "", file.file
+                )
+            }
         finally:
             await file.close()
 
@@ -109,19 +113,36 @@ def create_api(settings: Settings) -> FastAPI:
         return documents.spans(document_id)
 
     @app.get("/api/documents/{document_id}/original")
-    def original(document_id: str):
+    def original(document_id: str, download: bool = True):
         with documents.lock:
             document = documents.get(document_id)
-            data = documents.path(document_id).read_bytes()
-        return Response(
-            data,
-            media_type="application/octet-stream",
+            stream = documents.path(document_id).open("rb")
+        inline_pdf = not download and document["filename"].lower().endswith(".pdf")
+        disposition = "inline" if inline_pdf else "attachment"
+
+        def chunks():
+            try:
+                while chunk := stream.read(1024 * 1024):
+                    yield chunk
+            finally:
+                stream.close()
+
+        return StreamingResponse(
+            chunks(),
+            media_type="application/pdf" if inline_pdf else "application/octet-stream",
+            background=BackgroundTask(stream.close),
             headers={
-                "Content-Disposition": "attachment; filename*=UTF-8''"
+                "Content-Disposition": disposition
+                + "; filename*=UTF-8''"
                 + quote(document["filename"]),
                 "X-Content-Type-Options": "nosniff",
             },
         )
+
+    @app.post("/api/documents/{document_id}/reprocess", status_code=202)
+    def reprocess_document(document_id: str):
+        documents.reprocess(document_id)
+        return {"id": document_id}
 
     @app.delete("/api/documents/{document_id}", status_code=204)
     def delete_document(document_id: str):

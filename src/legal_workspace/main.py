@@ -26,8 +26,12 @@ def create_app(settings: Settings):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Legal AI Workspace")
-    parser.add_argument("command", choices=["init", "serve", "worker", "check", "import-corpus"])
+    parser.add_argument(
+        "command",
+        choices=["init", "serve", "worker", "check", "import-corpus", "reprocess-documents"],
+    )
     parser.add_argument("--manifest", default="corpus/manifest.json")
+    parser.add_argument("--failed-only", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     try:
@@ -63,6 +67,17 @@ def main() -> int:
 
                 ids = import_corpus(DocumentService(database), Path(args.manifest))
                 print(f"Corpus documents imported: {len(ids)}")
+            elif args.command == "reprocess-documents":
+                from legal_workspace.documents.service import DocumentService
+
+                documents = DocumentService(database)
+                count = 0
+                for document in documents.list():
+                    if args.failed_only and document["status"] != "failed":
+                        continue
+                    documents.reprocess(document["id"])
+                    count += 1
+                print(f"Documents queued for reprocessing: {count}")
             elif args.command == "worker":
                 from legal_workspace.jobs.worker import Worker
 

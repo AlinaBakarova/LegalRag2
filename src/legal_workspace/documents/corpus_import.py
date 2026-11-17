@@ -7,8 +7,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+from legal_workspace.documents.limits import BASE_LIMITS
 from legal_workspace.documents.parsers import DocumentError
-from legal_workspace.documents.service import MAX_FILE, DocumentService
+from legal_workspace.documents.service import DocumentService
 
 
 class Entry(BaseModel):
@@ -37,18 +38,23 @@ def import_corpus(service: DocumentService, manifest_path: Path) -> list[str]:
         if not path.is_relative_to(root) or entry.key in keys:
             raise DocumentError("invalid_manifest_path_or_duplicate")
         keys.add(entry.key)
-        if path.stat().st_size > MAX_FILE:
+        if path.stat().st_size > BASE_LIMITS.file_bytes:
             raise DocumentError("file_size_limit")
-        data = path.read_bytes()
-        if hashlib.sha256(data).hexdigest() != entry.sha256:
+        with path.open("rb") as stream:
+            checksum = hashlib.file_digest(stream, "sha256").hexdigest()
+        if checksum != entry.sha256:
             raise DocumentError("corpus_checksum_mismatch")
-        prepared.append((entry, path.name, data))
-    return [
-        service.upload(
-            name,
-            data,
-            corpus_key=entry.key,
-            source=entry.model_dump(mode="json", exclude={"file", "sha256", "key"}),
-        )
-        for entry, name, data in prepared
-    ]
+        prepared.append((entry, path))
+    ids = []
+    for entry, path in prepared:
+        with path.open("rb") as stream:
+            ids.append(
+                service.upload_stream(
+                    path.name,
+                    stream,
+                    corpus_key=entry.key,
+                    expected_sha=entry.sha256,
+                    source=entry.model_dump(mode="json", exclude={"file", "sha256", "key"}),
+                )
+            )
+    return ids

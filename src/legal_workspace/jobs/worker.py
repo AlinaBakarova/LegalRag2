@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from uuid import uuid4
 
@@ -77,11 +78,19 @@ class Worker:
                 result = handler(claim.payload)
             except Exception as exc:
                 logger.warning(
-                    "job_handler_failed job_id=%s error_type=%s", claim.id, type(exc).__name__
+                    "job_handler_failed job_id=%s error_type=%s stack=%s",
+                    claim.id,
+                    type(exc).__name__,
+                    [
+                        (f.filename, f.lineno, f.name)
+                        for f in traceback.extract_tb(exc.__traceback__)
+                    ],
                 )
                 self.queue.fail(claim, "handler_failed")
             else:
-                if not self.queue.finish(claim, result):
+                if result.get("status") == "failed":
+                    self.queue.fail(claim, "document_processing_failed", retryable=False)
+                elif not self.queue.finish(claim, result):
                     logger.warning("job_result_discarded job_id=%s reason=lease_lost", claim.id)
         finally:
             with self._lock:

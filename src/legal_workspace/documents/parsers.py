@@ -1,8 +1,12 @@
 """Conservative extraction: locators refer to extracted text, not rendered line positions."""
 
 import io
+import logging
+import traceback
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import BinaryIO
 
 from docx import Document as DocxDocument
 from docx.oxml.ns import qn
@@ -10,9 +14,10 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from pypdf import PdfReader
 
-PARSER_VERSION = "text-v1:pypdf6:docx1"
-MAX_TEXT = 2_000_000
-MAX_PAGES = 1000
+from legal_workspace.documents.limits import USER_LIMITS, DocumentLimits
+
+PARSER_VERSION = "text-v2:pypdf6:docx1"
+logger = logging.getLogger(__name__)
 
 
 class DocumentError(ValueError):
@@ -25,59 +30,88 @@ class Extraction:
     warnings: list[str] = field(default_factory=list)
     status: str = "ready"
     length: int = 0
+    count: int = 0
+    sink: Callable[[dict], None] | None = None
 
     def add(self, text: str, locator: dict):
-        if self.length + len(text) > MAX_TEXT:
-            raise DocumentError("text_limit")
         if not text.strip():
             return
-        self.spans.append(
-            {
-                "ordinal": len(self.spans),
-                "text": text,
-                "locator": locator,
-                "start": self.length,
-                "end": self.length + len(text),
-            }
-        )
+        span = {
+            "ordinal": self.count,
+            "text": text,
+            "locator": locator,
+            "start": self.length,
+            "end": self.length + len(text),
+        }
+        if self.sink:
+            self.sink(span)
+        else:
+            self.spans.append(span)
+        self.count += 1
         self.length += len(text) + 1  # The canonical full text joins spans with a newline.
 
 
-def extract(data: bytes, suffix: str) -> Extraction:
-    result = Extraction()
+def extract(
+    data: bytes | BinaryIO,
+    suffix: str,
+    *,
+    limits: DocumentLimits = USER_LIMITS,
+    sink: Callable[[dict], None] | None = None,
+) -> Extraction:
+    result = Extraction(sink=sink)
+    stream = io.BytesIO(data) if isinstance(data, bytes) else data
+    stream.seek(0)
     try:
         if suffix == ".txt":
+            text_stream = io.TextIOWrapper(stream, encoding="utf-8-sig", newline=None)
             try:
-                text = data.decode("utf-8-sig")
+                for number, line in enumerate(text_stream, 1):
+                    if "\x00" in line:
+                        raise DocumentError("binary_text")
+                    result.add(line.rstrip("\r\n"), {"type": "line", "line": number})
             except UnicodeDecodeError as exc:
                 raise DocumentError("utf8_required") from exc
-            if "\x00" in text:
-                raise DocumentError("binary_text")
-            for number, line in enumerate(text.splitlines(), 1):
-                result.add(line, {"type": "line", "line": number})
+            finally:
+                text_stream.detach()
         elif suffix == ".pdf":
-            if not data.startswith(b"%PDF-"):
+            if stream.read(5) != b"%PDF-":
                 raise DocumentError("invalid_pdf")
-            reader = PdfReader(io.BytesIO(data), strict=True)
+            stream.seek(0)
+            reader = PdfReader(stream, strict=True)
             if reader.is_encrypted:
                 raise DocumentError("encrypted_pdf")
-            if len(reader.pages) > MAX_PAGES:
+            if len(reader.pages) > limits.pdf_pages:
                 raise DocumentError("page_limit")
             for number, page in enumerate(reader.pages, 1):
-                text = page.extract_text() or ""
+                try:
+                    text = page.extract_text() or ""
+                except Exception as exc:
+                    frames = [
+                        (f.filename, f.lineno, f.name)
+                        for f in traceback.extract_tb(exc.__traceback__)
+                    ]
+                    logger.warning(
+                        "pdf_page_failed page=%s error_type=%s stack=%s",
+                        number,
+                        type(exc).__name__,
+                        frames,
+                    )
+                    result.warnings.append(f"page_read_failed:{number}")
+                    continue
                 if not text.strip():
                     result.warnings.append(f"page_without_text:{number}")
                 result.add(text, {"type": "page", "page": number})
             if result.warnings:
-                result.status = "needs_review" if result.spans else "needs_ocr"
+                result.status = "needs_review" if result.count else "needs_ocr"
         elif suffix == ".docx":
-            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            with zipfile.ZipFile(stream) as archive:
                 if (
                     len(archive.infolist()) > 2000
-                    or sum(i.file_size for i in archive.infolist()) > 50_000_000
+                    or sum(i.file_size for i in archive.infolist()) > limits.docx_expanded_bytes
                 ):
                     raise DocumentError("docx_expansion_limit")
-            document = DocxDocument(io.BytesIO(data))
+            stream.seek(0)
+            document = DocxDocument(stream)
             paragraph = table_number = 0
             for block in document.element.body:
                 if block.tag == qn("w:p"):
@@ -117,7 +151,7 @@ def extract(data: bytes, suffix: str) -> Extraction:
                 )
             ):
                 result.warnings.append("unsupported_docx_elements")
-            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            with zipfile.ZipFile(stream) as archive:
                 if any(
                     name.startswith(
                         (
@@ -140,7 +174,10 @@ def extract(data: bytes, suffix: str) -> Extraction:
     except DocumentError:
         raise
     except Exception as exc:
+        # Stack locations help diagnosis without logging exception messages/document contents.
+        frames = [(f.filename, f.lineno, f.name) for f in traceback.extract_tb(exc.__traceback__)]
+        logger.error("document_parse_failed error_type=%s stack=%s", type(exc).__name__, frames)
         raise DocumentError("invalid_document") from exc
-    if not result.spans and result.status != "needs_ocr":
+    if not result.count and result.status != "needs_ocr":
         raise DocumentError("empty_document")
     return result

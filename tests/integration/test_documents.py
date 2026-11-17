@@ -191,12 +191,12 @@ def test_lost_lease_cannot_publish_extraction(database, monkeypatch):
     claim = JobQueue(database).claim("worker", 30)
     original_extract = service_module.extract
 
-    def expire(data, suffix):
+    def expire(data, suffix, **kwargs):
         from legal_workspace.persistence.models import Job
 
         with database.transaction() as connection:
             connection.execute(update(Job).where(Job.id == claim.id).values(lease_expires_at=0))
-        return original_extract(data, suffix)
+        return original_extract(data, suffix, **kwargs)
 
     monkeypatch.setattr(service_module, "extract", expire)
     assert service.process(claim) == {"skipped": True}
