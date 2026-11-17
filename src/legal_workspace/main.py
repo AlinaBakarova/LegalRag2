@@ -37,6 +37,7 @@ def main() -> int:
             "reprocess-documents",
             "prepare-model",
             "index-documents",
+            "search-status",
             "evaluate-retrieval",
         ],
     )
@@ -99,6 +100,24 @@ def main() -> int:
 
                 count = SearchService(database).schedule_missing(args.force)
                 print(f"Documents queued for indexing: {count}")
+            elif args.command == "search-status":
+                import json
+
+                from legal_workspace.retrieval.service import SearchService
+                from legal_workspace.services import WorkspaceService
+
+                workspace = WorkspaceService(database)
+                print(
+                    json.dumps(
+                        {
+                            "search": SearchService(database).status(),
+                            "worker": workspace.status()["worker"],
+                            "jobs": workspace.jobs(),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
             elif args.command == "evaluate-retrieval":
                 from legal_workspace.retrieval.evaluation import evaluate
 

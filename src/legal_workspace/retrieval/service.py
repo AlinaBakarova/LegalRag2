@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import time
 from importlib.metadata import version
 from itertools import islice
@@ -14,6 +15,7 @@ from legal_workspace.retrieval.chunking import CHUNKING_VERSION, chunk_span, nor
 from legal_workspace.retrieval.embeddings import SearchError, get_embedder
 
 AVAILABLE = ("ready", "needs_review")
+logger = logging.getLogger(__name__)
 
 
 class SearchService:
@@ -220,6 +222,12 @@ class SearchService:
                         IndexGeneration.document_id == document_id, IndexGeneration.id != generation
                     )
                 )
+            logger.info(
+                "index_built document_id=%s generation_id=%s chunks=%s",
+                document_id,
+                generation,
+                ordinal,
+            )
             return {"indexed": True, "chunks": ordinal}
         except (Exception, KeyboardInterrupt):
             with self.db.transaction() as connection:
@@ -306,6 +314,20 @@ class SearchService:
         if self.embedder.token_count(query) > self.embedder.max_tokens:
             raise SearchError("query_too_long")
         allowed = set(document_ids) if document_ids is not None else None
+        with self.db.engine.connect() as connection:
+            candidates = select(Document.id).where(Document.status.in_(["uploaded", *AVAILABLE]))
+            active = (
+                select(Document.id)
+                .join(IndexGeneration, IndexGeneration.id == Document.active_index_id)
+                .where(*self._eligible())
+            )
+            if allowed is not None:
+                candidates = candidates.where(Document.id.in_(allowed))
+                active = active.where(Document.id.in_(allowed))
+            has_candidates = connection.execute(candidates.limit(1)).first() is not None
+            has_active = connection.execute(active.limit(1)).first() is not None
+        if has_candidates and not has_active:
+            raise SearchError("index_not_ready")
         # Keep memory bounded by scanning vectors in batches, rather than caching the whole corpus.
         rankings = []
         with self.db.engine.connect() as connection:

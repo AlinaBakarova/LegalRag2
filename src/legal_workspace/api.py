@@ -162,7 +162,7 @@ def create_api(settings: Settings) -> FastAPI:
             404
             if code == "source_not_found"
             else 503
-            if code in {"model_not_ready", "incompatible_index"}
+            if code in {"model_not_ready", "incompatible_index", "index_not_ready"}
             else 400
         )
         logger.warning("search_request_failed code=%s", code)

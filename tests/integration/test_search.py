@@ -152,7 +152,8 @@ def test_partial_generation_not_visible_and_deleted_during_build(
     def delete_while_embedding(texts):
         nonlocal calls
         calls += 1
-        assert search.search("тайна", mode="lexical") == []
+        with pytest.raises(SearchError, match="index_not_ready"):
+            search.search("тайна", mode="lexical")
         if calls == 2:
             documents.delete(document_id)
         return embed(texts)
@@ -171,13 +172,15 @@ def test_model_version_and_dimension_are_isolated(database, search, settings):
     other = FixedEmbedder()
     other.identity = "different-model"
     different = SearchService(database, other)
-    assert different.search("оплата") == []
+    with pytest.raises(SearchError, match="index_not_ready"):
+        different.search("оплата")
     assert different.schedule_missing() == 1
     old = search.search("оплата")[0]["id"]
     claim = JobQueue(database).claim("new-model", 120)
     different.process(claim)
     assert different.search("оплата")
-    assert search.search("оплата") == []
+    with pytest.raises(SearchError, match="index_not_ready"):
+        search.search("оплата")
     with pytest.raises(SearchError):
         search.source(old)
 
@@ -186,7 +189,8 @@ def test_reprocessing_invalidates_old_sources(database, search, settings):
     doc_id = add_indexed(database, search, settings, "Десять дней — срок оплаты.")
     old_id = search.search("оплата")[0]["id"]
     DocumentService(database).reprocess(doc_id)
-    assert search.search("оплата") == []
+    with pytest.raises(SearchError, match="index_not_ready"):
+        search.search("оплата")
     with pytest.raises(SearchError):
         search.source(old_id)
 
@@ -271,7 +275,8 @@ def test_mismatched_dimensions_and_corrupt_vector(database, search, settings):
     wider = FixedEmbedder()
     wider.dimension = 6
     # Even if an adapter accidentally reuses its identity, dimension is part of the fingerprint.
-    assert SearchService(database, wider).search("неустойка", mode="lexical") == []
+    with pytest.raises(SearchError, match="index_not_ready"):
+        SearchService(database, wider).search("неустойка", mode="lexical")
     with database.transaction() as connection:
         connection.execute(update(Chunk).values(embedding=b"bad"))
     with pytest.raises(SearchError, match="incompatible_index"):
@@ -331,3 +336,26 @@ def test_worker_indexes_after_extraction(database, settings, monkeypatch):
     assert worker.run_once()  # actual worker dispatch for indexing
     assert not worker.run_once()
     assert SearchService(database).search("неустойки")[0]["document_id"] == doc_id
+
+
+def test_pending_index_is_not_a_negative_search_result(database, settings):
+    from fastapi.testclient import TestClient
+
+    from legal_workspace.api import create_api
+
+    documents = DocumentService(database)
+    doc_id = documents.upload("pending.txt", "Неустойка за просрочку".encode())
+    Worker(database, settings).run_once()
+    with TestClient(create_api(settings), base_url="http://127.0.0.1") as client:
+        client.app.state.search_service._embedder = FixedEmbedder()
+        status = client.get("/api/search/status").json()
+        assert status["indexed"] == 0 and status["available"] == 1
+        response = client.post("/api/search", json={"query": "неустойка"})
+        assert response.status_code == 503
+        assert response.json()["detail"] == "index_not_ready"
+        # Empty or deleted scope still has ordinary empty results, not a readiness error.
+        assert (
+            client.post("/api/search", json={"query": "неустойка", "document_ids": []}).json() == []
+        )
+        client.delete(f"/api/documents/{doc_id}")
+        assert client.post("/api/search", json={"query": "неустойка"}).json() == []
