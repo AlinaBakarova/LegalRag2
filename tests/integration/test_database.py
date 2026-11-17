@@ -14,9 +14,22 @@ def test_migration_matches_models_and_enables_sqlite_features(database):
         assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
         assert (
             connection.exec_driver_sql("SELECT version_num FROM alembic_version").scalar_one()
-            == "0002_documents"
+            == "0003_search"
         )
-        assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+        assert (
+            compare_metadata(
+                MigrationContext.configure(
+                    connection,
+                    opts={
+                        "include_object": lambda obj, name, type_, reflected, compare_to: (
+                            not name.startswith("chunk_fts")
+                        )
+                    },
+                ),
+                Base.metadata,
+            )
+            == []
+        )
 
 
 def test_reinitialization_and_reopen_preserve_workspace(database, settings):

@@ -35,10 +35,10 @@ def test_document_icons_states_and_original_only(runtime):
             }
         )
         expect(page.get_by_role("button", name="browser.txt", exact=True)).to_be_visible()
-        expect(page.locator(".q-spinner")).to_be_visible()
+        expect(page.locator(".q-spinner:visible")).to_be_visible()
         runtime.start("worker")
         wait_until(lambda: runtime.client.get("/api/documents").json()[0]["status"] == "ready")
-        expect(page.locator(".q-spinner")).to_have_count(0, timeout=10000)
+        expect(page.locator(".q-spinner:visible")).to_have_count(0, timeout=10000)
         expect(page.get_by_text("Текст извлечён", exact=True)).to_have_count(0)
         expect(page.get_by_text("Защищённый источник", exact=True)).to_have_count(0)
         page.get_by_role("button", name="browser.txt", exact=True).click()

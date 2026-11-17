@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".local/share/legal-workspace")
     host: Literal["127.0.0.1", "localhost", "::1"] = "127.0.0.1"
+    embedding_threads: int = Field(default=2, ge=1, le=8)
     port: int = Field(default=8080, ge=1024, le=65535)
     poll_interval_seconds: float = Field(default=0.5, gt=0, le=30)
     heartbeat_interval_seconds: float = Field(default=2, gt=0, le=30)

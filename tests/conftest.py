@@ -13,6 +13,11 @@ from legal_workspace.persistence.database import Database
 
 
 def pytest_addoption(parser):
+    parser.addoption(
+        "--real-model",
+        action="store_true",
+        help="Run offline ONNX smoke test against a prepared real model",
+    )
     parser.addoption("--browser", action="store_true", help="Run the real Chromium acceptance test")
 
 
@@ -21,6 +26,13 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "browser" in item.keywords:
                 item.add_marker(pytest.mark.skip(reason="Enable with --browser; requires Chromium"))
+
+    if not config.getoption("--real-model"):
+        for item in items:
+            if "real_model" in item.keywords:
+                item.add_marker(
+                    pytest.mark.skip(reason="Enable with --real-model after prepare-model")
+                )
 
 
 @pytest.fixture
@@ -100,8 +112,8 @@ class Runtime:
         self.logs.append(log)
         return process
 
-    def start_web(self):
-        process = self.start("serve")
+    def start_web(self, *, code=None):
+        process = self.start("serve", code=code)
 
         def healthy():
             if process.poll() is not None:

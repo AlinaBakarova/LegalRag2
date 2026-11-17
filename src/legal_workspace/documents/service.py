@@ -17,7 +17,7 @@ from legal_workspace.documents.limits import USER_LIMITS, limits_for
 from legal_workspace.documents.parsers import PARSER_VERSION, DocumentError, extract
 from legal_workspace.jobs.queue import Claim
 from legal_workspace.persistence.database import Database
-from legal_workspace.persistence.models import Document, Job, SourceSpan
+from legal_workspace.persistence.models import Document, IndexGeneration, Job, SourceSpan
 
 MAX_FILE = USER_LIMITS.file_bytes
 logger = logging.getLogger(__name__)
@@ -235,6 +235,7 @@ class DocumentService:
                 )
                 if not live or not active:
                     return {"skipped": True}
+                self._invalidate_index(connection, document_id)
                 connection.execute(delete(SourceSpan).where(SourceSpan.document_id == document_id))
                 if status != "failed":
                     spool.seek(0)
@@ -248,8 +249,13 @@ class DocumentService:
                         status=status,
                         warnings=warnings,
                         parser_version=PARSER_VERSION,
+                        text_revision=uuid4().hex,
                     )
                 )
+                if status in {"ready", "needs_review"}:
+                    from legal_workspace.retrieval.service import SearchService
+
+                    SearchService.enqueue(connection, document_id)
         logger.log(
             logging.WARNING if warnings else logging.INFO,
             "document_extracted document_id=%s job_id=%s status=%s warnings=%s",
@@ -265,6 +271,7 @@ class DocumentService:
             self.get(document_id)
             with self.db.transaction(immediate=True) as connection:
                 self._delete_jobs(connection, document_id)
+                self._invalidate_index(connection, document_id)
                 connection.execute(delete(SourceSpan).where(SourceSpan.document_id == document_id))
                 connection.execute(
                     update(Document)
@@ -272,6 +279,7 @@ class DocumentService:
                     .values(
                         status="uploaded",
                         warnings=[],
+                        text_revision=None,
                     )
                 )
                 self._enqueue(connection, document_id)
@@ -279,11 +287,20 @@ class DocumentService:
     @staticmethod
     def _delete_jobs(connection, document_id):
         rows = connection.execute(
-            select(Job.id, Job.payload).where(Job.kind == "document.extract")
+            select(Job.id, Job.payload).where(Job.kind.in_(["document.extract", "search.index"]))
         ).all()
         for job_id, payload in rows:
             if payload.get("document_id") == document_id:
                 connection.execute(delete(Job).where(Job.id == job_id))
+
+    @staticmethod
+    def _invalidate_index(connection, document_id):
+        connection.execute(
+            update(Document).where(Document.id == document_id).values(active_index_id=None)
+        )
+        connection.execute(
+            delete(IndexGeneration).where(IndexGeneration.document_id == document_id)
+        )
 
     def delete(self, document_id):
         with self.lock:

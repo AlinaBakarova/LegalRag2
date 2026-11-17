@@ -81,6 +81,8 @@ class Document(Base):
     parser_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
     warnings: Mapped[list] = mapped_column(JSON)
     source: Mapped[dict] = mapped_column(JSON)
+    text_revision: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    active_index_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     corpus_key: Mapped[str | None] = mapped_column(String(200), unique=True, nullable=True)
 
 
@@ -97,3 +99,35 @@ class SourceSpan(Base):
     locator: Mapped[dict] = mapped_column(JSON)
     start: Mapped[int] = mapped_column(Integer)
     end: Mapped[int] = mapped_column(Integer)
+
+
+class IndexGeneration(Base):
+    __tablename__ = "index_generations"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    document_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("documents.id", ondelete="CASCADE"), index=True
+    )
+    text_revision: Mapped[str] = mapped_column(String(32))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    dimension: Mapped[int] = mapped_column(Integer)
+    state: Mapped[str] = mapped_column(String(16))
+    job_id: Mapped[str] = mapped_column(String(32))
+    lease_token: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    __table_args__ = (sa.UniqueConstraint("generation_id", "ordinal"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    generation_id: Mapped[str] = mapped_column(
+        sa.ForeignKey("index_generations.id", ondelete="CASCADE"), index=True
+    )
+    span_id: Mapped[int] = mapped_column(sa.ForeignKey("source_spans.id", ondelete="CASCADE"))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    start: Mapped[int] = mapped_column(Integer)
+    end: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(sa.Text)
+    heading: Mapped[str] = mapped_column(sa.Text)
+    terms: Mapped[str] = mapped_column(sa.Text)
+    embedding: Mapped[bytes] = mapped_column(sa.LargeBinary)

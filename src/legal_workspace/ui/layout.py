@@ -51,17 +51,11 @@ def register_pages(service: WorkspaceService) -> None:
                 with ui.row().classes("w-full items-center"):
                     ui.label("Рабочее пространство").classes("text-lg font-semibold")
                     ui.space()
-                    ui.badge("Этап 2", color="secondary").props("outline")
+                    ui.badge("Этап 3", color="secondary").props("outline")
                 ui.separator()
-                with ui.column().classes("flex-1 w-full items-center justify-center gap-5 py-12"):
-                    ui.icon("auto_stories", size="38px").classes("empty-icon")
-                    ui.label("Основа для внимательной работы с документами").classes(
-                        "text-2xl font-medium text-center max-w-md"
-                    )
-                    ui.label(
-                        "Загрузите документ или выберите файл в библиотеке, "
-                        "чтобы открыть его оригинал."
-                    ).classes("text-center text-sm muted max-w-md leading-relaxed")
+                from legal_workspace.ui.search import search_panel
+
+                search_panel(service.database)
                 with ui.row().classes("w-full items-center gap-3"):
                     ui.input(placeholder="Чат будет доступен после подключения поиска и LLM").props(
                         "outlined aria-label=Вопрос"

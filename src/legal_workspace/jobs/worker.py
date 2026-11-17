@@ -71,6 +71,12 @@ class Worker:
                 def handler(_payload):
                     return DocumentService(self.database).process(claim)
 
+            if claim.kind == "search.index" and handler is None:
+                from legal_workspace.retrieval.service import SearchService
+
+                def handler(_payload):
+                    return SearchService(self.database).process(claim)
+
             if handler is None:
                 self.queue.fail(claim, "unsupported_job_kind", retryable=False)
                 return True
@@ -86,7 +92,16 @@ class Worker:
                         for f in traceback.extract_tb(exc.__traceback__)
                     ],
                 )
-                self.queue.fail(claim, "handler_failed")
+                from legal_workspace.retrieval.embeddings import SearchError
+
+                if isinstance(exc, SearchError) and str(exc) == "model_not_ready":
+                    logger.warning(
+                        "search_model_not_ready: run legal-workspace prepare-model, "
+                        "then index-documents"
+                    )
+                    self.queue.fail(claim, "model_not_ready", retryable=False)
+                else:
+                    self.queue.fail(claim, "handler_failed")
             else:
                 if result.get("status") == "failed":
                     self.queue.fail(claim, "document_processing_failed", retryable=False)
@@ -98,6 +113,11 @@ class Worker:
         return True
 
     def run(self) -> None:
+        from legal_workspace.retrieval.embeddings import model_path
+        from legal_workspace.retrieval.service import SearchService
+
+        if (model_path(self.settings.data_dir) / "manifest.json").exists():
+            SearchService(self.database).schedule_missing()
         now = time.time()
         with self.database.transaction() as connection:
             connection.execute(

@@ -28,10 +28,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Local Legal AI Workspace")
     parser.add_argument(
         "command",
-        choices=["init", "serve", "worker", "check", "import-corpus", "reprocess-documents"],
+        choices=[
+            "init",
+            "serve",
+            "worker",
+            "check",
+            "import-corpus",
+            "reprocess-documents",
+            "prepare-model",
+            "index-documents",
+            "evaluate-retrieval",
+        ],
     )
     parser.add_argument("--manifest", default="corpus/manifest.json")
     parser.add_argument("--failed-only", action="store_true")
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     try:
@@ -78,6 +89,20 @@ def main() -> int:
                     documents.reprocess(document["id"])
                     count += 1
                 print(f"Documents queued for reprocessing: {count}")
+            elif args.command == "prepare-model":
+                from legal_workspace.retrieval.embeddings import prepare_model
+
+                manifest = prepare_model(settings.data_dir)
+                print(f"Local model prepared: {manifest['model']} @ {manifest['revision']}")
+            elif args.command == "index-documents":
+                from legal_workspace.retrieval.service import SearchService
+
+                count = SearchService(database).schedule_missing(args.force)
+                print(f"Documents queued for indexing: {count}")
+            elif args.command == "evaluate-retrieval":
+                from legal_workspace.retrieval.evaluation import evaluate
+
+                print(evaluate(settings.data_dir))
             elif args.command == "worker":
                 from legal_workspace.jobs.worker import Worker
 
@@ -88,6 +113,14 @@ def main() -> int:
         finally:
             database.close()
     except Exception as exc:
+        from legal_workspace.retrieval.embeddings import SearchError
+
+        if isinstance(exc, SearchError):
+            print(
+                f"Search unavailable: {exc}. Run prepare-model, then index-documents.",
+                file=sys.stderr,
+            )
+            return 1
         # Log only the class: SQL/HTTP exceptions can embed sensitive input.
         logging.getLogger(__name__).error(
             "startup_or_runtime_failed error_type=%s", type(exc).__name__

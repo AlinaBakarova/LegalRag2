@@ -50,6 +50,9 @@ class Database:
         from legal_workspace.documents.service import DocumentService
 
         DocumentService(self).recover()
+        from legal_workspace.retrieval.service import SearchService
+
+        SearchService(self).recover()
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[Connection]:

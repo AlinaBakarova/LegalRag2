@@ -1,9 +1,11 @@
 import logging
 from contextlib import asynccontextmanager
+from typing import Literal
 from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -13,6 +15,8 @@ from legal_workspace.config import Settings
 from legal_workspace.documents.parsers import DocumentError
 from legal_workspace.documents.service import DocumentService
 from legal_workspace.persistence.database import Database
+from legal_workspace.retrieval.embeddings import SearchError
+from legal_workspace.retrieval.service import SearchService
 from legal_workspace.services import WorkspaceService
 
 logger = logging.getLogger(__name__)
@@ -147,5 +151,41 @@ def create_api(settings: Settings) -> FastAPI:
     @app.delete("/api/documents/{document_id}", status_code=204)
     def delete_document(document_id: str):
         documents.delete(document_id)
+
+    search_service = SearchService(database)
+    app.state.search_service = search_service
+
+    @app.exception_handler(SearchError)
+    async def search_error(_request: Request, exc: SearchError):
+        code = str(exc)
+        status = (
+            404
+            if code == "source_not_found"
+            else 503
+            if code in {"model_not_ready", "incompatible_index"}
+            else 400
+        )
+        logger.warning("search_request_failed code=%s", code)
+        return JSONResponse({"detail": code}, status_code=status)
+
+    class SearchRequest(BaseModel):
+        query: str = Field(min_length=1, max_length=1500)
+        mode: Literal["hybrid", "lexical", "semantic"] = "hybrid"
+        document_ids: list[str] | None = Field(default=None, max_length=100)
+        limit: int = Field(default=10, ge=1, le=20)
+
+    @app.post("/api/search")
+    def search(request: SearchRequest):
+        return search_service.search(
+            request.query, mode=request.mode, document_ids=request.document_ids, limit=request.limit
+        )
+
+    @app.get("/api/search/status")
+    def search_status():
+        return search_service.status()
+
+    @app.get("/api/search/chunks/{chunk_id}")
+    def source(chunk_id: int):
+        return search_service.source(chunk_id)
 
     return app
