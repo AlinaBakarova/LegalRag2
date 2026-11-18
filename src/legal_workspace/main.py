@@ -128,7 +128,10 @@ def main() -> int:
                 worker = Worker(database, settings)
                 signal.signal(signal.SIGTERM, lambda *_: worker.stop())
                 signal.signal(signal.SIGINT, lambda *_: worker.stop())
-                worker.run()
+                from legal_workspace.rag.trace import rag_log_file
+
+                with rag_log_file(settings.data_dir):
+                    worker.run()
         finally:
             database.close()
     except Exception as exc:

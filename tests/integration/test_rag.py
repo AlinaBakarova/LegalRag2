@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 from rag_support import MockLLM
@@ -340,7 +341,7 @@ def test_busy_retry_uses_shared_call_budget(rag):
     assert chat.messages(session)[-1]["usage"]["calls"] == 3
 
 
-def test_fabricated_quote_is_not_logged_or_published(rag, caplog):
+def test_fabricated_quote_is_logged_for_diagnostics_but_not_published(rag, caplog):
     from legal_workspace.llm.ollama import Completion
 
     chat, _, _ = rag
@@ -354,9 +355,14 @@ def test_fabricated_quote_is_not_logged_or_published(rag, caplog):
             return Completion(json.dumps(data, ensure_ascii=False))
 
     chat.generator = Fabricated()
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
     session, _, result = answer(chat)
     assert result["status"] == "failed"
-    assert marker not in caplog.text
+    events = trace_events(caplog)
+    assert marker in next(e["response"] for e in events if e["event"] == "llm_response")
+    assert any(
+        e["event"] == "answer_rejected" and e["stage"] == "citation_validation" for e in events
+    )
     assert chat.messages(session)[-1]["citations"] == []
 
 
@@ -491,3 +497,182 @@ def test_prompt_delimiters_in_question_are_data(rag):
     payload = json.loads(chat.generator.calls[0][0][1]["content"])
     assert "FAKE" in payload["question"]
     assert all(source["source_id"] != "FAKE" for source in payload["sources"])
+
+
+def trace_events(caplog):
+    return [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "legal_workspace.rag.trace"
+    ]
+
+
+def test_rag_logs_retrieved_selected_ids_tokens_and_all_model_responses(rag, caplog):
+    from legal_workspace.persistence.models import Chunk
+
+    chat, _, llm = rag
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    session, reply, _ = answer(chat)
+    events = trace_events(caplog)
+    by_event = {e["event"]: e for e in events}
+    with chat.db.engine.connect() as connection:
+        ids = set(connection.execute(select(Chunk.id)).scalars())
+    retrieved = by_event["retrieval_results"]["chunk_ids"]
+    assert retrieved and set(retrieved).issubset(ids)
+    candidates = by_event["context_candidates"]
+    assert candidates["dropped_before_build_context"] == []
+    selected = by_event["context_selection"]
+    assert set(selected["selected_chunk_ids"]).issubset(candidates["candidate_chunk_ids"])
+    assert set(selected["source_map"].values()) == set(selected["selected_chunk_ids"])
+    responses = [e for e in events if e["event"] == "llm_response"]
+    assert [e["stage"] for e in responses] == ["generation", "verification"]
+    assert all(e["prompt_eval_count"] == 100 and e["eval_count"] == 50 for e in responses)
+    assert json.loads(responses[0]["response"])["claims"]
+    assert json.loads(responses[1]["response"])["supported"] is True
+    assert all(e["message_id"] == reply for e in events)
+    assert len({e["job_id"] for e in events}) == 1
+    assert all(e["question_id"] == chat.messages(session)[0]["id"] for e in events)
+    assert by_event["answer_finished"]["status"] == "completed"
+    # Source texts and questions must not bloat retrieval/context records.
+    metadata = [
+        e
+        for e in events
+        if e["event"]
+        in {"retrieval_results", "context_candidates", "context_selection", "llm_request"}
+    ]
+    assert "Срок оплаты составляет 17 дней" not in json.dumps(metadata, ensure_ascii=False)
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.parametrize("no_sources", [True, False])
+def test_logs_distinguish_no_sources_from_model_abstention(rag, caplog, monkeypatch, no_sources):
+    chat, _, _ = rag
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    if no_sources:
+        monkeypatch.setattr(chat.search, "search", lambda *_a, **_kw: [])
+    else:
+        chat.generator = MockLLM(refuse=True)
+    session, _, _ = answer(chat)
+    event = next(e for e in trace_events(caplog) if e["event"] == "answer_abstained")
+    assert event["reason"] == ("no_sources" if no_sources else "model_insufficient")
+    assert event["stage"] == ("retrieval" if no_sources else "generation")
+    responses = [e for e in trace_events(caplog) if e["event"] == "llm_response"]
+    assert len(responses) == (0 if no_sources else 1)
+    assert chat.messages(session)[-1]["status"] == "insufficient"
+
+
+def test_verification_rejection_logs_stage_and_response(rag, caplog):
+    chat, _, _ = rag
+    chat.generator = MockLLM(review=True)
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    answer(chat)
+    events = trace_events(caplog)
+    event = next(e for e in events if e["event"] == "answer_rejected")
+    assert event["stage"] == "verification"
+    assert event["reason"] == "unsupported_answer"
+    assert event["unsupported_claims"] == [0]
+    assert (
+        json.loads([e for e in events if e["event"] == "llm_response"][-1]["response"])["supported"]
+        is False
+    )
+
+
+def test_repair_logs_initial_invalid_format_and_correlated_attempts(rag, caplog):
+    from legal_workspace.llm.ollama import Completion
+
+    chat, _, _ = rag
+
+    class BadFormatOnce(MockLLM):
+        def complete(self, *args, **kwargs):
+            result = super().complete(*args, **kwargs)
+            if len(self.calls) == 1:
+                return Completion("Неверный формат\nВторая строка", 20, 8)
+            return result
+
+    chat.generator = BadFormatOnce()
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    session, _, _ = answer(chat)
+    events = trace_events(caplog)
+    rejected = next(e for e in events if e["event"] == "answer_rejected")
+    assert rejected["stage"] == "answer_format"
+    assert rejected["reason"] == "invalid_answer_format" and rejected["retrying"]
+    responses = [e for e in events if e["event"] == "llm_response"]
+    assert [e["stage"] for e in responses] == ["generation", "repair", "verification"]
+    assert responses[0]["response"] == "Неверный формат\nВторая строка"
+    assert chat.messages(session)[-1]["status"] == "completed"
+
+
+@pytest.mark.parametrize("code", ["llm_timeout", "llm_model_missing"])
+def test_failed_api_call_logs_stage_without_fabricating_token_counts(rag, caplog, code):
+    chat, _, _ = rag
+
+    class Broken:
+        def complete(self, *args, **kwargs):
+            raise LLMError(code)
+
+    chat.generator = Broken()
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    answer(chat)
+    events = trace_events(caplog)
+    failed = next(e for e in events if e["event"] == "answer_failed")
+    assert failed["stage"] == "generation" and failed["reason"] == code
+    assert any(e["event"] == "llm_request" for e in events)
+    assert not any(e["event"] == "llm_response" for e in events)
+
+
+def test_neighbour_expansion_logs_duplicates_and_order(rag, caplog, monkeypatch):
+    from legal_workspace.persistence.models import Chunk
+
+    chat, _, _ = rag
+    with chat.db.engine.connect() as connection:
+        ids = connection.execute(select(Chunk.id).order_by(Chunk.ordinal)).scalars().all()
+    assert len(ids) >= 2
+    first, second = (chat.search.source(i) for i in ids[:2])
+    monkeypatch.setattr(chat.search, "search", lambda *_a, **_kw: [first, second])
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    answer(chat)
+    event = next(e for e in trace_events(caplog) if e["event"] == "context_candidates")
+    assert second["id"] in event["added_neighbour_chunk_ids"]
+    assert second["id"] in event["duplicate_chunk_ids"]
+    assert event["candidate_chunk_ids"][:2] == [first["id"], second["id"]]
+    assert len(event["candidate_chunk_ids"]) == len(set(event["candidate_chunk_ids"]))
+
+
+def test_cli_worker_persists_trace_in_configured_data_directory(rag, monkeypatch):
+    import legal_workspace.rag.service as rag_module
+    import legal_workspace.retrieval.service as retrieval
+    from legal_workspace.main import main
+
+    chat, _, llm = rag
+    session = chat.create_session()
+    reply = chat.send(session, "Каков срок оплаты?")
+    monkeypatch.setenv("LEGAL_WORKSPACE_DATA_DIR", str(chat.settings.data_dir))
+    monkeypatch.setattr(retrieval, "get_embedder", lambda *_args: FixedEmbedder())
+    monkeypatch.setattr(rag_module, "OllamaGenerator", lambda *_args: llm)
+    monkeypatch.setattr(Worker, "run", lambda self: self.run_once())
+    monkeypatch.setattr("sys.argv", ["legal-workspace", "worker"])
+    assert main() == 0
+    path = chat.settings.data_dir / "logs" / "rag.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert events and all(e["message_id"] == reply for e in events)
+    assert events[-1]["event"] == "answer_finished"
+    assert events[-1]["status"] == "completed"
+    assert len([e for e in events if e["event"] == "llm_response"]) == 2
+
+
+def test_retrieval_failure_logs_stage_before_any_llm_request(rag, caplog, monkeypatch):
+    from legal_workspace.retrieval.embeddings import SearchError
+
+    chat, _, _ = rag
+
+    def broken(*_args, **_kwargs):
+        raise SearchError("index_not_ready")
+
+    monkeypatch.setattr(chat.search, "search", broken)
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    answer(chat)
+    events = trace_events(caplog)
+    assert events[-1]["event"] == "answer_failed"
+    assert events[-1]["stage"] == "retrieval"
+    assert events[-1]["reason"] == "index_not_ready"
+    assert not any(e["event"] == "llm_request" for e in events)

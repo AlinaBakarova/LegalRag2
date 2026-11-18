@@ -17,6 +17,7 @@ from legal_workspace.persistence.models import (
     SourceSpan,
 )
 from legal_workspace.rag.pipeline import CallBudget, build_context, generate_answer
+from legal_workspace.rag.trace import RagTrace
 from legal_workspace.retrieval.embeddings import SearchError
 from legal_workspace.retrieval.service import SearchService
 
@@ -363,13 +364,17 @@ class ChatService:
                 dependencies[document_id] = revision
         return [{"role": m["role"], "content": m["content"]} for m in prior], dependencies
 
-    def _context_sources(self, question, scope, history):
+    def _context_sources(self, question, scope, history, *, trace=None):
         previous_questions = [m["content"] for m in history if m["role"] == "user"][-1:]
         query = (" ".join(previous_questions) + " " + question).strip()[-1500:]
         found = self.search.search(query, document_ids=scope, limit=8)
+        if trace:
+            trace.emit("retrieval_results", chunk_ids=[item["id"] for item in found])
         # Expand a retrieved header to a neighbouring chunk in the same generation.
         expanded = []
         seen = set()
+        neighbours = []
+        duplicates = []
         for item in found:
             candidates = [item]
             with self.db.engine.connect() as connection:
@@ -385,10 +390,21 @@ class ChatService:
                     )
                     if neighbour:
                         candidates.append(self.search.source(neighbour))
+                        neighbours.append(neighbour)
             for candidate in candidates:
                 if candidate["id"] not in seen:
                     seen.add(candidate["id"])
                     expanded.append(candidate)
+                else:
+                    duplicates.append(candidate["id"])
+        if trace:
+            trace.emit(
+                "context_candidates",
+                added_neighbour_chunk_ids=list(dict.fromkeys(neighbours)),
+                duplicate_chunk_ids=list(dict.fromkeys(duplicates)),
+                candidate_chunk_ids=[item["id"] for item in expanded],
+                dropped_before_build_context=[],  # No relevance filter precedes build_context.
+            )
         return expanded
 
     @staticmethod
@@ -424,7 +440,10 @@ class ChatService:
 
     def process(self, claim):
         reply_id = claim.payload["message_id"]
-        budget = CallBudget(self.settings, self.generator, lambda: self._check_live(claim))
+        trace = RagTrace(reply_id, claim.id)
+        budget = CallBudget(
+            self.settings, self.generator, lambda: self._check_live(claim), trace=trace
+        )
         coverage = {}
         try:
             with self.db.transaction(immediate=True) as connection:
@@ -436,7 +455,10 @@ class ChatService:
                     .first()
                 )
                 if reply is None or reply["status"] in TERMINAL:
+                    trace.emit("answer_skipped", reason="missing_or_terminal")
                     return {"skipped": True}
+                trace.question_id = reply["reply_to"]
+                trace.emit("answer_started", model=self.settings.llm_model)
                 self._live(connection, claim)
                 question = connection.scalar(
                     select(ChatMessage.content).where(ChatMessage.id == reply["reply_to"])
@@ -445,9 +467,13 @@ class ChatService:
                 connection.execute(
                     update(ChatMessage).where(ChatMessage.id == reply_id).values(status="running")
                 )
-            sources = self._context_sources(question, reply["scope"], history)
+            trace.stage = "retrieval"
+            sources = self._context_sources(question, reply["scope"], history, trace=trace)
             if sources:
-                messages, contexts = build_context(self.settings, question, history, sources)
+                trace.stage = "build_context"
+                messages, contexts = build_context(
+                    self.settings, question, history, sources, trace=trace
+                )
                 search_status = self.search.status()
                 coverage = {
                     "partial_sources": any(s["warnings"] for s in contexts.values()),
@@ -462,6 +488,8 @@ class ChatService:
                     dependencies[source["document_id"]] = source["text_revision"]
             else:
                 contexts = {}
+                trace.emit("answer_abstained", reason="no_sources")
+            trace.stage = "source_validation"
             with self.db.transaction(immediate=True) as connection:
                 self._live(connection, claim)
                 connection.execute(
@@ -491,6 +519,7 @@ class ChatService:
                 status = "completed" if draft.sufficient else "insufficient"
             else:
                 content, status, citations = INSUFFICIENT, "insufficient", []
+            trace.stage = "publication"
             with self.db.transaction(immediate=True) as connection:
                 self._live(connection, claim)
                 for citation in citations:
@@ -511,6 +540,7 @@ class ChatService:
                         error_code=None,
                     )
                 )
+            trace.emit("answer_finished", status=status, **budget.usage())
             logger.info(
                 "chat_answer_finished message_id=%s status=%s calls=%s",
                 reply_id,
@@ -520,8 +550,10 @@ class ChatService:
             return {"answered": True}
         except (LLMError, SearchError) as exc:
             code = str(exc)
+            trace.emit("answer_failed", reason=code, **budget.usage())
             with self.db.transaction(immediate=True) as connection:
                 if not self._owned(connection, claim):
+                    trace.emit("answer_discarded", reason="not_owned_or_sources_changed")
                     return {"skipped": True}
                 connection.execute(
                     update(ChatMessage)
@@ -536,3 +568,6 @@ class ChatService:
                 )
             logger.warning("chat_answer_failed message_id=%s code=%s", reply_id, code)
             return {"status": "failed", "error_code": code}
+        except Exception as exc:
+            trace.emit("answer_failed", reason="unexpected_error", error_type=type(exc).__name__)
+            raise

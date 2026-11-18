@@ -6,15 +6,20 @@ import httpx
 
 
 class LLMError(ValueError):
-    """Safe error code. Never include response bodies or model/user text."""
+    """Safe public code; optional completion is for explicitly requested local diagnostics."""
+
+    def __init__(self, code, *, completion=None):
+        super().__init__(code)
+        self.completion = completion
 
 
 @dataclass(frozen=True)
 class Completion:
     content: str
-    input_tokens: int = 0
-    output_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
     duration_ns: int = 0
+    finish_reason: str | None = None
 
 
 class Generator(Protocol):
@@ -77,16 +82,18 @@ class OllamaGenerator:
             result = json.loads(body)
             message = result["message"]
             content = message["content"]
-            if not result.get("done") or result.get("done_reason") == "length":
-                raise LLMError("llm_output_limit")
-            if not isinstance(content, str) or not content.strip():
-                raise LLMError("llm_invalid_response")
-            return Completion(
-                content,
-                int(result.get("prompt_eval_count", 0)),
-                int(result.get("eval_count", 0)),
+            completion = Completion(
+                content if isinstance(content, str) else "",
+                int(result["prompt_eval_count"]) if "prompt_eval_count" in result else None,
+                int(result["eval_count"]) if "eval_count" in result else None,
                 int(result.get("total_duration", 0)),
+                result.get("done_reason"),
             )
+            if not result.get("done") or result.get("done_reason") == "length":
+                raise LLMError("llm_output_limit", completion=completion)
+            if not isinstance(content, str) or not content.strip():
+                raise LLMError("llm_invalid_response", completion=completion)
+            return completion
         except httpx.TimeoutException as exc:
             raise LLMError("llm_timeout") from exc
         except httpx.ConnectError as exc:
