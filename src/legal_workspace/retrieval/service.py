@@ -13,6 +13,7 @@ from legal_workspace.jobs.queue import Claim
 from legal_workspace.persistence.models import Chunk, Document, IndexGeneration, Job, SourceSpan
 from legal_workspace.retrieval.chunking import CHUNKING_VERSION, chunk_span, normalize
 from legal_workspace.retrieval.embeddings import SearchError, get_embedder
+from legal_workspace.retrieval.evidence import evidence_priority, query_terms, structural_only
 
 AVAILABLE = ("ready", "needs_review")
 logger = logging.getLogger(__name__)
@@ -304,10 +305,12 @@ class SearchService:
             IndexGeneration.text_revision == Document.text_revision,
         )
 
-    def search(self, query: str, *, mode="hybrid", document_ids=None, limit=10):
+    def search(
+        self, query: str, *, mode="hybrid", document_ids=None, limit=10, evidence=False, trace=None
+    ):
         if mode not in {"hybrid", "lexical", "semantic"} or not query.strip() or len(query) > 1500:
             raise SearchError("invalid_query")
-        terms = normalize(query).split()[:50]
+        terms = query_terms(query) if evidence else normalize(query).split()[:50]
         if not terms:
             return []
         fingerprint = self.fingerprint
@@ -330,13 +333,16 @@ class SearchService:
             raise SearchError("index_not_ready")
         # Keep memory bounded by scanning vectors in batches, rather than caching the whole corpus.
         rankings = []
+        metrics = {}
+        structural_ids = set()
+        precision_ids = []
         with self.db.engine.connect() as connection:
             if mode in {"hybrid", "lexical"}:
                 fts_query = " OR ".join(
                     '"' + term.replace('"', '""') + '"' for term in dict.fromkeys(terms)
                 )
                 sql = text("""
-                    SELECT c.id, d.id AS document_id, bm25(chunk_fts) AS rank
+                    SELECT c.id, c.text, c.heading, d.id AS document_id, bm25(chunk_fts) AS rank
                     FROM chunk_fts JOIN chunks c ON c.id=chunk_fts.rowid
                     JOIN index_generations g ON g.id=c.generation_id
                     JOIN documents d ON d.id=g.document_id
@@ -349,10 +355,29 @@ class SearchService:
                 lexical = []
                 for row in rows:
                     if allowed is None or row.document_id in allowed:
+                        if evidence and structural_only(row.text, row.heading):
+                            structural_ids.add(row.id)
+                            continue
+                        metrics.setdefault(row.id, {}).update(
+                            fts_rank=len(lexical) + 1, bm25=row.rank
+                        )
                         lexical.append(row.id)
                         if len(lexical) == 60:
                             break
                 rankings.append(lexical)
+                if evidence and len(terms) > 1:
+                    precise_query = " AND ".join('"' + t + '"' for t in dict.fromkeys(terms))
+                    for row in connection.execute(
+                        sql, {"query": precise_query, "fingerprint": fingerprint}
+                    ):
+                        if allowed is not None and row.document_id not in allowed:
+                            continue
+                        if structural_only(row.text, row.heading):
+                            structural_ids.add(row.id)
+                            continue
+                        precision_ids.append(row.id)
+                        if len(precision_ids) == 60:
+                            break
             if mode in {"hybrid", "semantic"}:
                 vectors = self.embedder.embed([query])
                 if vectors.shape != (1, self.embedder.dimension) or not np.isfinite(vectors).all():
@@ -364,7 +389,7 @@ class SearchService:
                 vector = vector / norm
                 scores = []
                 statement = (
-                    select(Chunk.id, Chunk.embedding)
+                    select(Chunk.id, Chunk.embedding, Chunk.text, Chunk.heading)
                     .join(IndexGeneration, IndexGeneration.id == Chunk.generation_id)
                     .join(Document, Document.id == IndexGeneration.document_id)
                     .where(*self._eligible())
@@ -378,17 +403,27 @@ class SearchService:
                     matrix = np.stack([np.frombuffer(row.embedding, dtype="<f4") for row in batch])
                     if matrix.shape[1] != self.embedder.dimension or not np.isfinite(matrix).all():
                         raise SearchError("incompatible_index")
-                    scores.extend(
-                        (float(score), row.id)
-                        for score, row in zip(matrix @ vector, batch, strict=True)
-                    )
+                    for score, row in zip(matrix @ vector, batch, strict=True):
+                        if evidence and structural_only(row.text, row.heading):
+                            structural_ids.add(row.id)
+                            continue
+                        scores.append((float(score), row.id))
                     scores = sorted(scores, key=lambda item: (-item[0], item[1]))[:60]
                 rankings.append([chunk_id for _score, chunk_id in scores])
+                for rank, (score, chunk_id) in enumerate(scores, 1):
+                    metrics.setdefault(chunk_id, {}).update(vector_rank=rank, cosine=score)
         fused = {}
         for ranking in rankings:
             for rank, chunk_id in enumerate(ranking, 1):
                 fused[chunk_id] = fused.get(chunk_id, 0) + 1 / (60 + rank)
-        selected = sorted(fused, key=lambda chunk_id: (-fused[chunk_id], chunk_id))[:limit]
+        rrf_order = sorted(fused, key=lambda chunk_id: (-fused[chunk_id], chunk_id))
+        for rank, chunk_id in enumerate(rrf_order, 1):
+            metrics.setdefault(chunk_id, {}).update(rrf_rank=rank, rrf_score=fused[chunk_id])
+        for chunk_id in precision_ids:
+            fused.setdefault(chunk_id, 0.0)
+        selected = sorted(fused, key=lambda chunk_id: (-fused[chunk_id], chunk_id))
+        if not evidence:
+            selected = selected[:limit]
         results = []
         for chunk_id in selected:
             try:
@@ -396,8 +431,20 @@ class SearchService:
             except SearchError:
                 continue  # A source removed while searching cannot be returned.
             item["score"] = fused[chunk_id]
-            results.append(item)
-        return results
+            if not evidence or not structural_only(item["text"], item["heading"]):
+                results.append(item)
+        if evidence:
+            results.sort(key=lambda item: evidence_priority(item, terms, query), reverse=True)
+            if trace:
+                trace.emit(
+                    "retrieval_ranking",
+                    channels={str(i): detail for i, detail in metrics.items()},
+                    structural_chunk_ids=sorted(structural_ids)[:60],
+                    structural_count=len(structural_ids),
+                    precision_chunk_ids=precision_ids,
+                    selected_chunk_ids=[item["id"] for item in results[:limit]],
+                )
+        return results[:limit]
 
     def source(self, chunk_id):
         with self.db.engine.connect() as connection:
@@ -405,6 +452,8 @@ class SearchService:
                 connection.execute(
                     select(
                         Chunk.id,
+                        Chunk.generation_id,
+                        Chunk.ordinal,
                         Chunk.text,
                         Chunk.heading,
                         Chunk.start,

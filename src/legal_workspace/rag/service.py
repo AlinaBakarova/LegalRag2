@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from uuid import uuid4
 
@@ -18,7 +19,9 @@ from legal_workspace.persistence.models import (
 )
 from legal_workspace.rag.pipeline import CallBudget, build_context, generate_answer
 from legal_workspace.rag.trace import RagTrace
+from legal_workspace.retrieval.chunking import HEADING
 from legal_workspace.retrieval.embeddings import SearchError
+from legal_workspace.retrieval.evidence import ACTS, article_key, retrieval_query, structural_only
 from legal_workspace.retrieval.service import SearchService
 
 logger = logging.getLogger(__name__)
@@ -364,48 +367,154 @@ class ChatService:
                 dependencies[document_id] = revision
         return [{"role": m["role"], "content": m["content"]} for m in prior], dependencies
 
-    def _context_sources(self, question, scope, history, *, trace=None):
-        previous_questions = [m["content"] for m in history if m["role"] == "user"][-1:]
-        query = (" ".join(previous_questions) + " " + question).strip()[-1500:]
-        found = self.search.search(query, document_ids=scope, limit=8)
+    def _question_scope(self, question, scope, trace):
+        if scope is not None:
+            return scope
+        acts = [key for key, pattern in ACTS.items() if pattern.search(question)]
+        # Comparisons must keep user documents available alongside legislation.
+        comparison = any(word in question.casefold() for word in ("договор", "документ", "сравн"))
+        if not acts or comparison:
+            return scope
+        with self.db.engine.connect() as connection:
+            documents = connection.execute(
+                select(Document.id, Document.filename, Document.source, Document.corpus_key).where(
+                    Document.kind == "base", Document.status.in_(["ready", "needs_review"])
+                )
+            ).all()
+        matched = []
+        for doc in documents:
+            title = doc.source.get("title", "") + " " + doc.filename
+            key = (doc.corpus_key or "").casefold()
+            if any(
+                ACTS[act].search(title)
+                or key == {"koap": "koap-rf", "uk": "uk-rf", "gk": "gk-rf"}[act]
+                for act in acts
+            ):
+                matched.append(doc.id)
         if trace:
-            trace.emit("retrieval_results", chunk_ids=[item["id"] for item in found])
-        # Expand a retrieved header to a neighbouring chunk in the same generation.
-        expanded = []
-        seen = set()
-        neighbours = []
-        duplicates = []
+            trace.emit("retrieval_scope", requested_acts=acts, document_ids=matched)
+        return matched
+
+    def _expanded_source(self, item):
+        # Enclose the hit in its article's region on this page, preserving source offsets.
+        with self.db.engine.connect() as connection:
+            text = connection.scalar(
+                select(SourceSpan.text).where(SourceSpan.id == item["span_id"])
+            )
+            if text is None:
+                raise LLMError("sources_changed")
+            boundaries = (
+                [0] + [m.start() for m in HEADING.finditer(text) if m.start() > 0] + [len(text)]
+            )
+            left = max(bound for bound in boundaries[:-1] if bound <= item["start"])
+            right = next(bound for bound in boundaries[1:] if bound > item["start"])
+            # Paragraph boundaries first; complete sentences for unstructured prose.
+            edges = [0] + [m.end() for m in re.finditer(r"\n\s*\n", text)] + [len(text)]
+            if len(edges) == 2 and not article_key(item["heading"]):
+                edges = (
+                    [0]
+                    + [m.end() for m in re.finditer(r"[.!?]\s+(?=[А-ЯЁA-Z])", text)]
+                    + [len(text)]
+                )
+            small_left = max(left, max(e for e in edges if e <= item["start"]))
+            small_right = min(right, next((e for e in edges if e >= item["end"]), len(text)))
+            chunks = connection.execute(
+                select(Chunk.id, Chunk.start, Chunk.end)
+                .where(
+                    Chunk.generation_id == item["generation_id"],
+                    Chunk.span_id == item["span_id"],
+                    Chunk.start < right,
+                    Chunk.end > left,
+                )
+                .order_by(Chunk.ordinal)
+            ).all()
+        fallback = dict(
+            item,
+            text=text[small_left:small_right],
+            start=small_left,
+            end=small_right,
+            chunk_ids=[r.id for r in chunks if r.start < small_right and r.end > small_left],
+            context_partial=(small_left > left or small_right < right),
+        )
+        if not article_key(item["heading"]):
+            return fallback
+        return dict(
+            item,
+            text=text[left:right],
+            start=left,
+            end=right,
+            chunk_ids=[r.id for r in chunks],
+            fallback=fallback,
+        )
+
+    def _context_sources(self, question, scope, history, *, trace=None):
+        query = retrieval_query(question, history)
+        scope = self._question_scope(query, scope, trace)
+        found = self.search.search(query, document_ids=scope, limit=20, evidence=True, trace=trace)
+        if trace:
+            trace.emit(
+                "retrieval_results",
+                chunk_ids=[item["id"] for item in found],
+                history_used=query != question,
+            )
+        anchors, continuations, seen = [], [], set()
+        discarded, duplicates, limited = [], [], set()
+
+        def add(item, target):
+            if structural_only(item["text"], item["heading"]):
+                discarded.append(item["id"])
+                return
+            expanded = self._expanded_source(item)
+            key = (expanded["span_id"], expanded["start"], expanded["end"])
+            if key not in seen:
+                seen.add(key)
+                target.append(expanded)
+            else:
+                duplicates.append(item["id"])
+
+        # All independent hits are considered before optional article continuations.
         for item in found:
-            candidates = [item]
+            add(item, anchors)
+        articles = set()
+        for item in found:
+            key = (item["generation_id"], article_key(item["heading"]))
+            if not key[1] or key in articles:
+                continue
+            articles.add(key)
             with self.db.engine.connect() as connection:
-                chunk = connection.execute(
-                    select(Chunk.generation_id, Chunk.ordinal).where(Chunk.id == item["id"])
-                ).first()
-                if chunk:
-                    neighbour = connection.scalar(
-                        select(Chunk.id).where(
-                            Chunk.generation_id == chunk.generation_id,
-                            Chunk.ordinal == chunk.ordinal + 1,
+                ids = (
+                    connection.execute(
+                        select(Chunk.id)
+                        .where(
+                            Chunk.generation_id == item["generation_id"],
+                            Chunk.heading == item["heading"],
                         )
+                        .order_by(Chunk.ordinal)
+                        .limit(65)
                     )
-                    if neighbour:
-                        candidates.append(self.search.source(neighbour))
-                        neighbours.append(neighbour)
-            for candidate in candidates:
-                if candidate["id"] not in seen:
-                    seen.add(candidate["id"])
-                    expanded.append(candidate)
-                else:
-                    duplicates.append(candidate["id"])
+                    .scalars()
+                    .all()
+                )
+            if len(ids) > 64:
+                limited.add(key)
+            for chunk_id in ids[:64]:
+                add(self.search.source(chunk_id), continuations)
+        for source in anchors + continuations:
+            if (source["generation_id"], article_key(source["heading"])) in limited:
+                source["context_partial"] = True
         if trace:
             trace.emit(
                 "context_candidates",
-                added_neighbour_chunk_ids=list(dict.fromkeys(neighbours)),
+                added_neighbour_chunk_ids=[item["id"] for item in continuations],
                 duplicate_chunk_ids=list(dict.fromkeys(duplicates)),
-                candidate_chunk_ids=[item["id"] for item in expanded],
-                dropped_before_build_context=[],  # No relevance filter precedes build_context.
+                candidate_chunk_ids=[item["id"] for item in anchors + continuations],
+                dropped_before_build_context=[
+                    {"chunk_id": cid, "reason": "structural_only"}
+                    for cid in dict.fromkeys(discarded)
+                ],
+                expansion="article_regions_anchors_first",
             )
-        return expanded
+        return anchors + continuations
 
     @staticmethod
     def _verify_proof(connection, citation):
@@ -471,12 +580,16 @@ class ChatService:
             sources = self._context_sources(question, reply["scope"], history, trace=trace)
             if sources:
                 trace.stage = "build_context"
+                counter_factory = getattr(self.generator, "token_counter", None)
+                if counter_factory is not None:
+                    budget.counter = counter_factory()
                 messages, contexts = build_context(
-                    self.settings, question, history, sources, trace=trace
+                    self.settings, question, history, sources, trace=trace, counter=budget.counter
                 )
                 search_status = self.search.status()
                 coverage = {
                     "partial_sources": any(s["warnings"] for s in contexts.values()),
+                    "partial_context": any(s.get("context_partial") for s in contexts.values()),
                     "partial_corpus": search_status["indexed"] < search_status["available"],
                 }
                 for source in contexts.values():

@@ -1,8 +1,28 @@
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Protocol
 
 import httpx
+
+from legal_workspace.llm.tokens import TokenCounter, qwen_counter
+
+
+@lru_cache(maxsize=4)
+def _local_counter(url, model):
+    return _read_counter(url, model)
+
+
+def _read_counter(url, model, transport=None):
+    with httpx.Client(base_url=url, timeout=5, trust_env=False, transport=transport) as client:
+        with client.stream("POST", "/api/show", json={"model": model, "verbose": True}) as response:
+            response.raise_for_status()
+            body = bytearray()
+            for block in response.iter_bytes():
+                body.extend(block)
+                if len(body) > 16 * 1024 * 1024:
+                    raise ValueError("Tokenizer metadata too large")
+    return qwen_counter(json.loads(body))
 
 
 class LLMError(ValueError):
@@ -37,6 +57,18 @@ class OllamaGenerator:
     def __init__(self, settings, *, transport=None):
         self.settings = settings
         self.transport = transport
+
+    def token_counter(self):
+        try:
+            if self.transport is not None:
+                return _read_counter(
+                    self.settings.ollama_url, self.settings.llm_model, self.transport
+                )
+            return _local_counter(self.settings.ollama_url, self.settings.llm_model)
+        except Exception:
+            # Optional metadata must not prevent other local models from working.
+            # Failed metadata requests are not cached, so a later request can recover.
+            return TokenCounter()
 
     def complete(self, messages, schema, *, max_tokens, timeout_seconds=None):
         payload = {

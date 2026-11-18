@@ -207,6 +207,10 @@ def chat_panel(database):
                                         ).props("flat no-caps dense").classes(
                                             "max-w-full text-left"
                                         )
+                            if message["usage"].get("partial_context"):
+                                ui.label("В контекст вошла только часть исходного текста.").classes(
+                                    "text-xs text-amber-900"
+                                )
                             if message["usage"].get("partial_sources"):
                                 ui.label(
                                     "Часть источников не удалось прочитать полностью."

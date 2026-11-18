@@ -520,7 +520,7 @@ def test_rag_logs_retrieved_selected_ids_tokens_and_all_model_responses(rag, cap
     retrieved = by_event["retrieval_results"]["chunk_ids"]
     assert retrieved and set(retrieved).issubset(ids)
     candidates = by_event["context_candidates"]
-    assert candidates["dropped_before_build_context"] == []
+    assert all(d["reason"] == "structural_only" for d in candidates["dropped_before_build_context"])
     selected = by_event["context_selection"]
     assert set(selected["selected_chunk_ids"]).issubset(candidates["candidate_chunk_ids"])
     assert set(selected["source_map"].values()) == set(selected["selected_chunk_ids"])
@@ -620,20 +620,20 @@ def test_failed_api_call_logs_stage_without_fabricating_token_counts(rag, caplog
     assert not any(e["event"] == "llm_response" for e in events)
 
 
-def test_neighbour_expansion_logs_duplicates_and_order(rag, caplog, monkeypatch):
+def test_article_continuations_follow_all_anchors(rag, caplog, monkeypatch):
     from legal_workspace.persistence.models import Chunk
 
     chat, _, _ = rag
     with chat.db.engine.connect() as connection:
         ids = connection.execute(select(Chunk.id).order_by(Chunk.ordinal)).scalars().all()
     assert len(ids) >= 2
-    first, second = (chat.search.source(i) for i in ids[:2])
+    first, second = (chat.search.source(i) for i in (ids[0], ids[-1]))
     monkeypatch.setattr(chat.search, "search", lambda *_a, **_kw: [first, second])
     caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
     answer(chat)
     event = next(e for e in trace_events(caplog) if e["event"] == "context_candidates")
-    assert second["id"] in event["added_neighbour_chunk_ids"]
-    assert second["id"] in event["duplicate_chunk_ids"]
+    assert second["id"] not in event["added_neighbour_chunk_ids"]
+    assert event["expansion"] == "article_regions_anchors_first"
     assert event["candidate_chunk_ids"][:2] == [first["id"], second["id"]]
     assert len(event["candidate_chunk_ids"]) == len(set(event["candidate_chunk_ids"]))
 
@@ -676,3 +676,141 @@ def test_retrieval_failure_logs_stage_before_any_llm_request(rag, caplog, monkey
     assert events[-1]["stage"] == "retrieval"
     assert events[-1]["reason"] == "index_not_ready"
     assert not any(e["event"] == "llm_request" for e in events)
+
+
+def test_definition_survives_many_structural_hits_and_history(rag, settings, caplog):
+    from legal_workspace.persistence.models import Chunk, Document
+
+    chat, _, _ = rag
+    # Synthetic fixture only; not a replacement for the user's legal corpus.
+    content = (
+        "Кодекс Российской Федерации об административных правонарушениях\n"
+        + "\n".join(f"Глава {i}. Административные штрафы" for i in range(1, 90))
+        + "\nСтатья 3.5. Административный штраф\n"
+        + "ТЕСТОВОЕ определение: административный штраф является денежным взысканием.\n"
+        + "Статья 4. Иное тестовое условие\nИное тестовое условие действует отдельно."
+    )
+    doc = DocumentService(chat.db).upload("koap-test.txt", content.encode())
+    Worker(chat.db, settings).run_once()
+    with chat.db.transaction() as connection:
+        connection.execute(
+            update(Document)
+            .where(Document.id == doc)
+            .values(
+                kind="base",
+                corpus_key="koap-rf",
+                source={"title": "Кодекс Российской Федерации об административных правонарушениях"},
+            )
+        )
+    queue = JobQueue(chat.db)
+    claim = queue.claim("index", 120)
+    queue.finish(claim, chat.search.process(claim))
+    with chat.db.engine.connect() as connection:
+        definition = connection.scalar(
+            select(Chunk.id).where(
+                Chunk.generation_id
+                == select(Document.active_index_id).where(Document.id == doc).scalar_subquery(),
+                Chunk.text.contains("ТЕСТОВОЕ определение"),
+            )
+        )
+        before = connection.execute(select(Chunk.id, Chunk.embedding).order_by(Chunk.id)).all()
+    caplog.set_level(logging.INFO, logger="legal_workspace.rag.trace")
+    question = "Что такое административный штраф по КоАП РФ?"
+    sources = chat._context_sources(
+        question, None, [{"role": "user", "content": "Другая тема про сроки оплаты"}]
+    )
+    assert sources and any(definition in s["chunk_ids"] for s in sources[:8])
+    assert "денежным взысканием" in sources[0]["text"]
+    session, _, _ = answer(chat, question)
+    response = chat.messages(session)[-1]
+    assert response["status"] == "completed"
+    assert response["citations"][0]["document_id"] == doc
+    ranking = next(e for e in trace_events(caplog) if e["event"] == "retrieval_ranking")
+    assert ranking["structural_count"] >= 89
+    assert definition in ranking["selected_chunk_ids"][:8]
+    from legal_workspace.retrieval.diagnostics import diagnose
+
+    report = diagnose(chat.settings, question, definition, embedder=FixedEmbedder())
+    assert report["target"]["in_legacy_top8"] is False
+    assert definition in report["evidence_top20_ids"][:8]
+    with chat.db.engine.connect() as connection:
+        assert (
+            connection.execute(select(Chunk.id, Chunk.embedding).order_by(Chunk.id)).all() == before
+        )
+
+
+def test_long_article_context_preserves_continuations_and_exact_citation_ranges(rag, settings):
+    from legal_workspace.persistence.models import Chunk
+
+    chat, _, _ = rag
+    # TXT lines model separate page/paragraph spans; references must remain separate.
+    content = (
+        "Статья 7. Синтетическое длинное условие\n"
+        "Начальное тестовое правило устанавливается отдельно.\n"
+        + "\n".join(
+            f"Условие {i}: тестовая сторона обязана исполнить тестовое действие." for i in range(10)
+        )
+        + "\nИсключение: тестовое правило не действует при отсутствии тестового согласия."
+        + "\nСтатья 8. Несвязанная статья\nНЕ ПРИСОЕДИНЯТЬ К СТАТЬЕ 7."
+    )
+    doc = DocumentService(chat.db).upload("long-article.txt", content.encode())
+    Worker(chat.db, settings).run_once()
+    queue = JobQueue(chat.db)
+    claim = queue.claim("index", 120)
+    queue.finish(claim, chat.search.process(claim))
+    sources = chat._context_sources("Объясни тестовое правило статьи 7", [doc], [])
+    article = [s for s in sources if s["heading"].startswith("Статья 7.")]
+    assert any("Исключение:" in s["text"] for s in article)
+    assert all("НЕ ПРИСОЕДИНЯТЬ" not in s["text"] for s in article)
+    assert len({s["span_id"] for s in article}) > 4
+    with chat.db.engine.connect() as connection:
+        for s in article:
+            assert connection.scalar(select(Chunk.id).where(Chunk.id == s["id"])) is not None
+            assert s["document_id"] == doc
+
+
+def test_read_only_diagnostic_measures_ranks_without_reindex(rag):
+    from legal_workspace.persistence.models import Chunk
+    from legal_workspace.retrieval.diagnostics import diagnose
+
+    chat, _, _ = rag
+    with chat.db.engine.connect() as connection:
+        before = connection.execute(select(Chunk.id, Chunk.embedding).order_by(Chunk.id)).all()
+        target = before[-1].id
+    report = diagnose(chat.settings, "Каков срок оплаты?", target, embedder=FixedEmbedder())
+    assert report["target"]["fts_rank"] is not None
+    assert report["target"]["vector_rank"] is not None
+    assert report["target"]["rrf_score"] > 0
+    assert target in report["evidence_top20_ids"]
+    assert report["target"]["rrf_score"] == pytest.approx(
+        report["target"]["fts_rrf_contribution"] + report["target"]["vector_rrf_contribution"]
+    )
+    with chat.db.engine.connect() as connection:
+        assert (
+            connection.execute(select(Chunk.id, Chunk.embedding).order_by(Chunk.id)).all() == before
+        )
+
+
+def test_diagnostic_command_never_initializes_database(rag, monkeypatch, capsys):
+    import legal_workspace.retrieval.diagnostics as diagnostics
+    from legal_workspace.main import main
+    from legal_workspace.persistence.database import Database
+
+    def forbidden(*_args, **_kw):
+        pytest.fail("Read-only diagnostics must not run migrations or recover jobs")
+
+    chat, _, _ = rag
+    monkeypatch.setenv("LEGAL_WORKSPACE_DATA_DIR", str(chat.settings.data_dir))
+    monkeypatch.setattr(Database, "initialize", forbidden)
+    original = diagnostics.diagnose
+    monkeypatch.setattr(
+        diagnostics,
+        "diagnose",
+        lambda settings, query, cid: original(settings, query, cid, embedder=FixedEmbedder()),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["legal-workspace", "diagnose-retrieval", "--query", "оплата", "--chunk-id", "1"],
+    )
+    assert main() == 0
+    assert json.loads(capsys.readouterr().out)["target"]["chunk_id"] == 1

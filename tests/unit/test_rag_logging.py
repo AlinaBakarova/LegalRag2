@@ -19,7 +19,7 @@ def source(chunk_id, text):
     return {"id": chunk_id, "title": "Тест", "heading": "", "text": text, "start": 0}
 
 
-def test_context_logs_exact_selection_and_source_limit_without_excerpts(caplog):
+def test_context_accepts_more_than_four_sources_without_excerpts(caplog):
     caplog.set_level(logging.INFO, logger=logger.name)
     sources = [source(i, "Синтетический текст без юридических утверждений.") for i in range(1, 9)]
     _, contexts = build_context(
@@ -27,30 +27,30 @@ def test_context_logs_exact_selection_and_source_limit_without_excerpts(caplog):
     )
     event = events(caplog)[-1]
     assert event["candidate_chunk_ids"] == list(range(1, 9))
-    assert event["selected_chunk_ids"] == list(range(1, 5))
-    assert event["source_map"] == {f"S{i}": i for i in range(1, 5)}
-    assert event["dropped"] == [{"chunk_id": i, "reason": "source_limit"} for i in range(5, 9)]
+    assert event["selected_chunk_ids"] == list(range(1, 9))
+    assert event["source_map"] == {f"S{i}": i for i in range(1, 9)}
+    assert event["dropped"] == []
     assert event["trimmed"] == []
     assert "Синтетический текст" not in caplog.text
-    assert [s["id"] for s in contexts.values()] == [1, 2, 3, 4]
+    assert [s["id"] for s in contexts.values()] == list(range(1, 9))
 
 
-def test_context_logs_trimming_and_budget_exclusion_without_modifying_sources(caplog):
+def test_context_skips_oversized_regions_without_arbitrary_trimming(caplog):
     caplog.set_level(logging.INFO, logger=logger.name)
-    sources = [source(i, "Синтетический тестовый текст. " * 1000) for i in range(1, 7)]
-    settings = Settings(_env_file=None, llm_context_tokens=8192)
-    messages, contexts = build_context(settings, "Вопрос", [], sources, trace=RagTrace("m", "j"))
-    event = events(caplog)[-1]
-    assert event["trimmed"]
-    assert all(t["sent_chars"] < t["original_chars"] for t in event["trimmed"])
-    for retained in contexts.values():
-        assert retained["text"] == sources[retained["id"] - 1]["text"][: retained["end"]]
-    assert set(event["selected_chunk_ids"]) | {d["chunk_id"] for d in event["dropped"]} == set(
-        range(1, 7)
+    sources = [
+        source(1, "Синтетический тестовый текст. " * 1000),
+        source(2, "Завершённый короткий абзац с тестовым условием."),
+    ]
+    messages, contexts = build_context(
+        Settings(_env_file=None), "Вопрос", [], sources, trace=RagTrace("m", "j")
     )
-    assert any(d["reason"] == "context_budget" for d in event["dropped"])
+    event = events(caplog)[-1]
+    assert event["trimmed"] == []
+    assert event["dropped"] == [{"chunk_id": 1, "reason": "context_budget"}]
+    assert event["selected_chunk_ids"] == [2]
+    assert contexts["S1"]["text"] == sources[1]["text"]
     assert event["prompt_bytes"] == sum(len(m["content"].encode()) for m in messages)
-    assert all(len(s["text"]) > 20000 for s in sources)
+    assert len(sources[0]["text"]) > 20000
 
 
 def test_context_logs_all_discarded_before_raising(caplog):
@@ -131,3 +131,35 @@ def test_jsonl_file_survives_restart_escapes_control_characters_and_rotates(tmp_
         RagTrace("last", "j").emit("answer_finished", status="completed")
     assert len(path.read_text().splitlines()) == count + 1
     assert json.loads(path.read_text().splitlines()[-1])["message_id"] == "last"
+
+
+def test_budget_uses_whole_paragraph_fallback_and_marks_partial_article(caplog):
+    caplog.set_level(logging.INFO, logger=logger.name)
+    small = dict(
+        source(1, "Тестовое правило действует при выполнении тестового условия."),
+        heading="Статья 7. Тест",
+        end=60,
+        context_partial=True,
+    )
+    large = dict(
+        source(1, "Очень длинная синтетическая статья. " * 2000),
+        heading="Статья 7. Тест",
+        fallback=small,
+    )
+    _, contexts = build_context(
+        Settings(_env_file=None), "Вопрос", [], [large], trace=RagTrace("m", "j")
+    )
+    assert contexts["S1"]["text"] == small["text"]
+    assert contexts["S1"]["context_partial"] is True
+    assert events(caplog)[-1]["trimmed"][0]["reason"] == "paragraph_boundary"
+
+
+def test_budget_marks_missing_continuation_instead_of_claiming_complete_article():
+    first = dict(
+        source(1, "Синтетическое правило действует при выполнении условия."),
+        heading="Статья 7. Тест",
+    )
+    continuation = dict(source(2, "Синтетические исключения. " * 2000), heading="Статья 7. Тест")
+    _, contexts = build_context(Settings(_env_file=None), "Вопрос", [], [first, continuation])
+    assert list(contexts) == ["S1"]
+    assert contexts["S1"]["context_partial"] is True

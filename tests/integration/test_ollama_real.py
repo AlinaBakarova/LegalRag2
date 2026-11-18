@@ -17,7 +17,8 @@ from legal_workspace.retrieval.service import SearchService
 
 
 @pytest.mark.ollama
-def test_real_qwen_rag_answer_with_exact_citation(tmp_path):
+@pytest.mark.parametrize("definition", [False, True], ids=["contract", "definition-with-headings"])
+def test_real_qwen_rag_answer_with_exact_citation(tmp_path, definition):
     configured = Settings()
     try:
         response = httpx.get(configured.ollama_url + "/api/tags", timeout=10, trust_env=False)
@@ -33,13 +34,22 @@ def test_real_qwen_rag_answer_with_exact_citation(tmp_path):
     database.initialize()
     try:
         documents = DocumentService(database)
-        doc_id = documents.upload(
-            "synthetic-contract.txt",
-            (
-                "СИНТЕТИЧЕСКИЙ ТЕСТОВЫЙ ДОГОВОР. НЕ НОРМАТИВНЫЙ АКТ.\n"
-                "Статья 1. Срок оплаты\nСрок оплаты составляет 17 дней."
-            ).encode(),
+        content = (
+            "СИНТЕТИЧЕСКИЙ ТЕСТОВЫЙ ДОГОВОР. НЕ НОРМАТИВНЫЙ АКТ.\n"
+            "Статья 1. Срок оплаты\nСрок оплаты составляет 17 дней."
         )
+        question = "Каков срок оплаты по тестовому договору? Укажи срок и процитируй источник."
+        expected = "17"
+        if definition:
+            content = (
+                "СИНТЕТИЧЕСКИЙ ТЕСТ. НЕ НОРМАТИВНЫЙ АКТ.\n"
+                + "\n".join(f"Глава {i}. Административные штрафы" for i in range(1, 90))
+                + "\nСтатья 3.5. Административный штраф\n"
+                + "ТЕСТОВОЕ определение: административный штраф является денежным взысканием."
+            )
+            question = "Что такое административный штраф согласно тестовому документу?"
+            expected = "денежн"
+        doc_id = documents.upload("synthetic-example.txt", content.encode())
         Worker(database, settings).run_once()
         queue = JobQueue(database)
         search = SearchService(database, FixedEmbedder())
@@ -49,14 +59,14 @@ def test_real_qwen_rag_answer_with_exact_citation(tmp_path):
         session = chat.create_session()
         reply = chat.send(
             session,
-            "Каков срок оплаты по тестовому договору? Укажи срок и процитируй источник.",
+            question,
             [doc_id],
         )
         claim = queue.claim("real-qwen", 900)
         result = chat.process(claim)
         message = chat.messages(session)[-1]
         assert message["status"] == "completed", message.get("error", result)
-        assert "17" in message["content"]
+        assert expected in message["content"].casefold()
         assert message["model"] == settings.llm_model
         assert message["usage"]["calls"] <= settings.llm_max_calls
         assert message["citations"]

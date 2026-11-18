@@ -39,9 +39,12 @@ def main() -> int:
             "index-documents",
             "search-status",
             "evaluate-retrieval",
+            "diagnose-retrieval",
         ],
     )
     parser.add_argument("--manifest", default="corpus/manifest.json")
+    parser.add_argument("--query")
+    parser.add_argument("--chunk-id", type=int)
     parser.add_argument("--failed-only", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -54,6 +57,19 @@ def main() -> int:
         return 2
 
     try:
+        if args.command == "diagnose-retrieval":
+            import json
+
+            from legal_workspace.retrieval.diagnostics import diagnose
+
+            if not args.query or args.chunk_id is None:
+                parser.error("diagnose-retrieval requires --query and --chunk-id")
+            print(
+                json.dumps(
+                    diagnose(settings, args.query, args.chunk_id), ensure_ascii=False, indent=2
+                )
+            )
+            return 0
         if args.command == "serve":
             import uvicorn
 

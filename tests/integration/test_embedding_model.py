@@ -62,3 +62,36 @@ def test_real_local_model_russian_embeddings():
     assert np.isfinite(vectors).all()
     assert np.allclose(np.linalg.norm(vectors, axis=1), 1, atol=1e-5)
     assert vectors[0] @ vectors[1] > vectors[0] @ vectors[2]
+
+
+@pytest.mark.real_model
+def test_real_embedding_retrieves_definition_among_navigation_chunks(database, settings):
+    from sqlalchemy import select
+
+    from legal_workspace.config import Settings
+    from legal_workspace.documents.service import DocumentService
+    from legal_workspace.jobs.queue import JobQueue
+    from legal_workspace.jobs.worker import Worker
+    from legal_workspace.persistence.models import Chunk
+    from legal_workspace.retrieval.embeddings import get_embedder
+    from legal_workspace.retrieval.service import SearchService
+
+    model = get_embedder(Settings().data_dir)
+    content = (
+        "СИНТЕТИЧЕСКИЙ ТЕСТ. НЕ НОРМАТИВНЫЙ АКТ.\n"
+        + "\n".join(f"Глава {i}. Административные штрафы" for i in range(1, 90))
+        + "\nСтатья 3.5. Административный штраф\n"
+        + "ТЕСТОВОЕ определение: административный штраф является денежным взысканием."
+    )
+    doc = DocumentService(database).upload("synthetic-definition.txt", content.encode())
+    Worker(database, settings).run_once()
+    search = SearchService(database, model)
+    queue = JobQueue(database)
+    claim = queue.claim("real-model-index", 900)
+    queue.finish(claim, search.process(claim))
+    results = search.search(
+        "Что такое административный штраф по КоАП РФ?", document_ids=[doc], evidence=True
+    )
+    assert any("ТЕСТОВОЕ определение" in item["text"] for item in results[:8])
+    with database.engine.connect() as connection:
+        assert connection.execute(select(Chunk.id)).first() is not None
