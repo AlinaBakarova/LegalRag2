@@ -24,15 +24,14 @@ def chat_panel(database):
     snapshot = None
     active_dialog = None
     active_citation = None
-    ui.label("Чат по вашим документам").classes("text-lg font-semibold")
-    ui.label(
-        "Локальная модель отвечает по доступным источникам. Проверяйте выводы по цитатам."
-    ).classes("text-sm muted")
+    sending = False
+    pending = False
 
     async def select_session(event):
         nonlocal current, snapshot
         current = event.value
         snapshot = None
+        history_dialog.close()
         await refresh()
 
     async def new_session():
@@ -40,10 +39,6 @@ def chat_panel(database):
         current = await run.io_bound(chat.create_session)
         snapshot = None
         await refresh()
-
-    with ui.row().classes("w-full items-center gap-3"):
-        sessions = ui.select({}, label="Диалог", on_change=select_session).classes("flex-1 min-w-0")
-        ui.button("Новый диалог", icon="add", on_click=new_session).props("flat no-caps")
 
     async def delete_session():
         if not current:
@@ -63,17 +58,39 @@ def chat_panel(database):
             ui.button("Отмена", on_click=dialog.close)
         dialog.open()
 
-    with ui.button(icon="delete_outline", on_click=delete_session).props(
-        'flat round dense aria-label="Удалить диалог"'
-    ):
-        ui.tooltip("Удалить диалог")
-    scope = (
-        ui.select({}, multiple=True, label="Документы для вопроса (пусто — вся библиотека)")
-        .props("clearable use-chips")
-        .classes("w-full")
-    )
-    with ui.scroll_area().classes("w-full h-[50vh]"):
-        transcript = ui.column().classes("w-full gap-4")
+    with ui.dialog() as history_dialog, ui.card().classes("w-80 max-w-full gap-4"):
+        ui.label("Диалоги").classes("text-lg font-semibold")
+        sessions = ui.select({}, label="Диалог", on_change=select_session).classes("w-full")
+        with ui.row().classes("w-full items-center justify-between"):
+            ui.button("Удалить диалог", icon="delete_outline", on_click=delete_session).props(
+                "flat no-caps"
+            )
+            ui.button("Закрыть", on_click=history_dialog.close).props("flat no-caps")
+
+    with ui.dialog() as scope_dialog, ui.card().classes("w-96 max-w-full gap-4"):
+        ui.label("Источники для ответа").classes("text-lg font-semibold")
+        ui.label("По умолчанию используются все документы библиотеки.").classes("text-sm muted")
+        scope = (
+            ui.select({}, multiple=True, label="Документы для вопроса")
+            .props("clearable use-chips")
+            .classes("w-full")
+        )
+        ui.button("Готово", on_click=scope_dialog.close).props("flat no-caps")
+
+    with ui.row().classes("w-full items-center chat-toolbar"):
+        ui.label("Чат по вашим документам").classes("font-semibold chat-toolbar-title")
+        for icon, label, callback in (
+            ("history", "История диалогов", history_dialog.open),
+            ("tune", "Выбрать документы", scope_dialog.open),
+            ("edit_square", "Новый диалог", new_session),
+        ):
+            with ui.button(icon=icon, on_click=callback).props(
+                f'flat round dense aria-label="{label}"'
+            ):
+                ui.tooltip(label)
+
+    with ui.element("div").classes("transcript-scroll"):
+        transcript = ui.column().classes("transcript-content")
 
     async def show_citation(citation_id):
         nonlocal active_dialog, active_citation
@@ -114,7 +131,7 @@ def chat_panel(database):
         await refresh()
 
     async def refresh():
-        nonlocal current, snapshot, active_dialog, active_citation
+        nonlocal current, snapshot, active_dialog, active_citation, pending
         try:
             history = await run.io_bound(chat.sessions)
             options = {s["id"]: s["title"] for s in history}
@@ -137,22 +154,39 @@ def chat_panel(database):
                     active_dialog.close()
                     active_dialog, active_citation = None, None
             pending = any(m["status"] in {"queued", "running"} for m in messages)
-            send_button.set_enabled(not pending)
+            send_button.set_enabled(not pending and not sending)
             latest = json.dumps(messages, sort_keys=True, ensure_ascii=False)
             if latest == snapshot:
                 return
+            # Preserve the reading position; follow new messages only when already at the bottom.
+            await ui.run_javascript("""(() => {
+                const el = document.querySelector('.transcript-scroll');
+                if (el) {
+                    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+                    el.dataset.follow = String(remaining < 80);
+                }
+            })()""")
             snapshot = latest
             transcript.clear()
             with transcript:
                 if not messages:
-                    ui.label("Задайте вопрос по документам вашей библиотеки.").classes(
-                        "muted text-sm"
-                    )
-                for message in messages:
-                    with ui.card().classes("w-full shadow-none border gap-2"):
-                        ui.label("Вы" if message["role"] == "user" else "Ответ").classes(
-                            "font-medium text-sm"
+                    with ui.column().classes("chat-empty"):
+                        ui.icon("menu_book", size="34px").classes("empty-icon")
+                        ui.label("Что вы хотите узнать по документам?").classes(
+                            "text-2xl font-medium"
                         )
+                        ui.label(
+                            "Задайте вопрос — ответ будет сопровождаться цитатами источников."
+                        ).classes("text-sm muted max-w-md")
+                for message in messages:
+                    style = (
+                        "chat-message-user"
+                        if message["role"] == "user"
+                        else "chat-message-assistant"
+                    )
+                    with ui.column().classes(f"chat-message {style}"):
+                        if message["role"] != "user":
+                            ui.label("Legal AI").classes("font-medium text-sm text-primary")
                         status = message["status"]
                         if message["role"] == "user":
                             ui.label(message["content"]).classes(
@@ -170,7 +204,9 @@ def chat_panel(database):
                                             on_click=lambda _e, cid=citation["id"]: show_citation(
                                                 cid
                                             ),
-                                        ).props("flat no-caps").classes("w-full text-left")
+                                        ).props("flat no-caps dense").classes(
+                                            "max-w-full text-left"
+                                        )
                             if message["usage"].get("partial_sources"):
                                 ui.label(
                                     "Часть источников не удалось прочитать полностью."
@@ -212,14 +248,19 @@ def chat_panel(database):
                                 "Повторить запрос",
                                 on_click=lambda _e, rid=message["id"]: retry(rid),
                             ).props("flat no-caps")
+            ui.run_javascript("""requestAnimationFrame(() => {
+                const el = document.querySelector('.transcript-scroll');
+                if (el?.dataset.follow === 'true') el.scrollTop = el.scrollHeight;
+            })""")
         except Exception as exc:
             log_failure("chat_refresh", exc)
             ui.notify("Не удалось обновить диалог", type="negative")
 
     async def send():
-        nonlocal current, snapshot
-        if not question.value or not question.value.strip():
+        nonlocal current, snapshot, sending
+        if sending or pending or not question.value or not question.value.strip():
             return
+        sending = True
         send_button.disable()
         try:
             if current is None:
@@ -243,17 +284,33 @@ def chat_panel(database):
             log_failure("chat_send", exc)
             ui.notify("Не удалось отправить вопрос", type="negative")
             send_button.enable()
+        finally:
+            sending = False
+            send_button.set_enabled(not pending)
 
-    with ui.row().classes("w-full items-center gap-3"):
-        question = (
-            ui.textarea(label="Вопрос", placeholder="Задайте вопрос по документам")
-            .props("outlined maxlength=1500 autogrow")
-            .classes("flex-1 min-w-0")
+    with ui.column().classes("chat-composer"):
+        with ui.row().classes("w-full composer-row"):
+            question = (
+                ui.textarea(label="Вопрос", placeholder="Задайте вопрос по документам")
+                .props("outlined rounded maxlength=1500 autogrow rows=1")
+                .classes("flex-1 min-w-0 chat-question")
+            )
+            question.on(
+                "keydown",
+                send,
+                js_handler="""(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+                        event.preventDefault();
+                        emit();
+                    }
+                }""",
+            )
+            send_button = (
+                ui.button(icon="arrow_upward", on_click=send)
+                .props('round unelevated aria-label="Отправить"')
+                .classes("mb-1")
+            )
+        ui.label("Локальная модель · Проверяйте выводы по источникам").classes(
+            "text-xs muted self-center text-center"
         )
-        send_button = ui.button(icon="arrow_upward", on_click=send).props(
-            'round aria-label="Отправить"'
-        )
-    ui.label(
-        "Генерация и поиск выполняются локально. Документы не отправляются платным API."
-    ).classes("text-xs muted")
     ui.timer(2, refresh, immediate=True)

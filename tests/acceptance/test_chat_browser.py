@@ -60,12 +60,19 @@ Worker(database,settings).run()
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(executable_path=executable, headless=True)
-            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            page = browser.new_page(viewport={"width": 1366, "height": 768})
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(runtime.base_url)
-            page.get_by_label("Вопрос", exact=True).fill("Каков срок оплаты?")
-            page.get_by_role("button", name="Отправить", exact=True).click()
+            question = page.get_by_label("Вопрос", exact=True)
+            expect(question).to_be_in_viewport()
+            question.fill("Каков срок оплаты?")
+            question.press("Shift+Enter")
+            question.press("End")
+            question.type("Укажите источник.")
+            expect(question).to_have_value("Каков срок оплаты?\nУкажите источник.")
+            expect(page.locator(".chat-message-user")).to_have_count(0)
+            question.press("Enter")
             expect(page.get_by_text("Срок оплаты составляет 17 дней.", exact=True)).to_be_visible(
                 timeout=15000
             )
@@ -74,8 +81,32 @@ Worker(database,settings).run()
             page.get_by_role("button", name="Закрыть", exact=True).click()
             page.reload()
             expect(page.get_by_text("Срок оплаты составляет 17 дней.", exact=True)).to_be_visible()
+            # A long conversation must scroll inside the transcript, leaving the composer visible.
+            for i in range(4):
+                question.fill(f"Уточнение {i}: " + "Каков срок оплаты? " * 20)
+                page.get_by_role("button", name="Отправить", exact=True).click()
+                expect(page.locator(".chat-message-assistant")).to_have_count(i + 2)
+                expect(page.get_by_role("button", name="Источник: Договор.txt")).to_have_count(
+                    i + 2, timeout=15000
+                )
+                expect(question).to_be_in_viewport()
+            assert page.locator(".transcript-scroll").evaluate(
+                "el => el.scrollHeight > el.clientHeight"
+            )
+            assert page.evaluate("document.documentElement.scrollHeight <= window.innerHeight")
+            page.set_viewport_size({"width": 390, "height": 844})
+            expect(question).to_be_in_viewport()
+            page.get_by_role("button", name="Новый диалог", exact=True).click()
+            expect(page.locator(".chat-message-user")).to_have_count(0)
+            expect(
+                page.get_by_text("Что вы хотите узнать по документам?", exact=True)
+            ).to_be_visible()
+            page.get_by_role("button", name="История диалогов", exact=True).click()
+            page.get_by_label("Диалог", exact=True).click()
+            page.get_by_role("option").filter(has_text="Каков срок оплаты?").click()
+            expect(page.locator(".chat-message-assistant")).to_have_count(5)
             DocumentService(db).delete(doc_id)
-            expect(page.get_by_text("Ответ удалён, поскольку", exact=False)).to_be_visible(
+            expect(page.get_by_text("Ответ удалён, поскольку", exact=False).first).to_be_visible(
                 timeout=10000
             )
             expect(page.get_by_text("Срок оплаты составляет 17 дней.", exact=True)).to_have_count(0)

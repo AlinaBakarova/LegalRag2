@@ -6,7 +6,7 @@ from playwright.sync_api import expect, sync_playwright
 
 
 @pytest.mark.browser
-def test_main_screen_has_chat_placeholder_and_no_retrieval_controls(runtime):
+def test_chat_composer_fits_viewport_and_has_no_retrieval_controls(runtime):
     executable = os.environ.get("LEGAL_WORKSPACE_CHROMIUM") or shutil.which("chromium")
     if not executable:
         pytest.fail("Chromium is required")
@@ -25,7 +25,24 @@ def test_main_screen_has_chat_placeholder_and_no_retrieval_controls(runtime):
             expect(page.get_by_label(label, exact=True)).to_have_count(0)
         expect(page.get_by_role("button", name="Найти", exact=True)).to_have_count(0)
         expect(page.get_by_text("Поиск по документам", exact=True)).to_have_count(0)
-        page.set_viewport_size({"width": 390, "height": 844})
-        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        for width, height in ((1920, 1080), (1366, 768), (1024, 768), (390, 844)):
+            page.set_viewport_size({"width": width, "height": height})
+            expect(page.get_by_label("Вопрос", exact=True)).to_be_in_viewport()
+            expect(page.get_by_role("button", name="Отправить", exact=True)).to_be_in_viewport()
+            composer = page.locator(".chat-composer").bounding_box()
+            assert composer["y"] + composer["height"] <= height
+            assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+            assert page.evaluate("document.documentElement.scrollHeight <= window.innerHeight")
+            expect(
+                page.get_by_text("Что вы хотите узнать по документам?", exact=True)
+            ).to_be_visible()
+        page.get_by_role("button", name="Документы", exact=True).click()
+        expect(page.get_by_text("Мои документы", exact=True)).to_be_visible()
+        page.get_by_role("button", name="Закрыть документы", exact=True).click()
+        expect(page.get_by_label("Вопрос", exact=True)).to_be_in_viewport()
+        page.get_by_role("button", name="Выбрать документы", exact=True).click()
+        expect(page.get_by_label("Документы для вопроса", exact=True)).to_be_visible()
+        page.get_by_role("button", name="Готово", exact=True).click()
+        expect(page.get_by_label("Документы для вопроса", exact=True)).not_to_be_visible()
         assert not errors
         browser.close()
